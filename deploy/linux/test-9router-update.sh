@@ -33,6 +33,8 @@ assert_not_exists() {
 make_fakes() {
   mkdir -p "$TMP/bin" "$TMP/opt" "$TMP/run"
   : >"$TMP/systemctl.log"
+  : >"$TMP/npm.log"
+  : >"$TMP/curl.log"
 
   cat >"$TMP/bin/git" <<'EOF'
 #!/usr/bin/env bash
@@ -53,6 +55,7 @@ if [[ "$1" != run || "$2" != build ]]; then
   echo "unexpected npm command: $*" >&2
   exit 64
 fi
+printf 'npm run build\n' >>"$NINEROUTER_TEST_NPM_LOG"
 if [[ "${NINEROUTER_TEST_BUILD_FAIL:-0}" == 1 ]]; then
   exit 42
 fi
@@ -70,6 +73,7 @@ EOF
   cat >"$TMP/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 set -eu
+printf 'curl health-check\n' >>"$NINEROUTER_TEST_CURL_LOG"
 if [[ "${NINEROUTER_TEST_CURL_FAIL:-0}" == 1 ]]; then
   exit 22
 fi
@@ -92,6 +96,8 @@ run_updater() {
   NINEROUTER_CURL="$TMP/bin/curl" \
   NINEROUTER_NODE="$(command -v node)" \
   NINEROUTER_TEST_SYSTEMCTL_LOG="$TMP/systemctl.log" \
+  NINEROUTER_TEST_NPM_LOG="$TMP/npm.log" \
+  NINEROUTER_TEST_CURL_LOG="$TMP/curl.log" \
   "$@" bash "$UPDATER" >"$output_file" 2>&1
 }
 
@@ -122,6 +128,7 @@ test_build_failure_keeps_current_service_running() {
     fail 'updater succeeded despite a failed build'
   fi
 
+  grep -q '^npm run build$' "$TMP/npm.log" || fail 'build failure did not reach npm run build'
   assert_file "$TMP/opt/9router/current-marker"
   ! grep -q '^stop 9router$' "$TMP/systemctl.log" || fail 'service stopped after build failure'
   cleanup
@@ -137,6 +144,7 @@ test_health_check_failure_preserves_previous_release_and_reports_recovery() {
     fail 'updater succeeded despite a failed health check'
   fi
 
+  grep -q '^curl health-check$' "$TMP/curl.log" || fail 'health check failure did not reach curl'
   grep -q '^start 9router$' "$TMP/systemctl.log" || fail 'new service was not started'
   assert_dir "$TMP/opt/9router.previous"
   assert_file "$TMP/opt/9router.previous/current-marker"
