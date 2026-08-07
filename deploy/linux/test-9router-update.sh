@@ -98,7 +98,9 @@ run_updater() {
 test_successful_update_installs_runtime_and_restarts_service() {
   TMP="$(mktemp -d)"
   make_fakes
-  run_updater "$TMP/output"
+  if ! run_updater "$TMP/output"; then
+    fail 'updater failed during the successful update scenario'
+  fi
 
   assert_file "$TMP/opt/9router/.runtime/custom-server.js"
   assert_file "$TMP/opt/9router/.runtime/server.js"
@@ -137,6 +139,7 @@ test_health_check_failure_preserves_previous_release_and_reports_recovery() {
 
   grep -q '^start 9router$' "$TMP/systemctl.log" || fail 'new service was not started'
   assert_dir "$TMP/opt/9router.previous"
+  assert_file "$TMP/opt/9router.previous/current-marker"
   grep -Fq "mv $TMP/opt/9router.previous $TMP/opt/9router" "$TMP/output" || \
     fail 'missing manual recovery command in updater output'
   cleanup
