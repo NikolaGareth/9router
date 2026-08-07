@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="${NINEROUTER_ROOT:-/opt/9router}"
+BUILD_DIR="${NINEROUTER_BUILD_DIR:-/opt/9router-build}"
+PREVIOUS_DIR="${NINEROUTER_PREVIOUS_DIR:-/opt/9router.previous}"
+LOCK_FILE="${NINEROUTER_LOCK_FILE:-/run/9router-update.lock}"
+GIT="${NINEROUTER_GIT:-/usr/bin/git}"
+NPM="${NINEROUTER_NPM:-/opt/node-v24.15.0-npm/node/bin/npm}"
+NODE="${NINEROUTER_NODE:-/opt/node-v24.15.0-npm/node/bin/node}"
+SYSTEMCTL="${NINEROUTER_SYSTEMCTL:-/usr/bin/systemctl}"
+CURL="${NINEROUTER_CURL:-/usr/bin/curl}"
+REPOSITORY="https://github.com/NikolaGareth/9router.git"
+BRANCH="master"
+
+mkdir -p "$(dirname "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
+flock -n 9 || { echo "已有 9Router 更新正在执行" >&2; exit 1; }
+
+for path in "$ROOT" "$BUILD_DIR" "$PREVIOUS_DIR"; do
+  [[ "$path" == /* ]] || { echo "部署路径必须是绝对路径：$path" >&2; exit 1; }
+  case "$path" in
+    /|/opt|/root) echo "拒绝危险部署路径：$path" >&2; exit 1 ;;
+  esac
+done
+[[ "$ROOT" != "$BUILD_DIR" && "$ROOT" != "$PREVIOUS_DIR" && "$BUILD_DIR" != "$PREVIOUS_DIR" ]] || {
+  echo "部署目录必须互不相同" >&2
+  exit 1
+}
+
+swapped=0
+cleanup_build() {
+  if [[ "$swapped" -eq 0 && -e "$BUILD_DIR" ]]; then
+    rm -rf -- "$BUILD_DIR"
+  fi
+}
+trap cleanup_build EXIT
+
+rm -rf -- "$BUILD_DIR"
+"$GIT" clone --depth 1 --branch "$BRANCH" "$REPOSITORY" "$BUILD_DIR"
+(
+  cd "$BUILD_DIR"
+  NEXT_TELEMETRY_DISABLED=1 "$NPM" ci
+  NEXT_TELEMETRY_DISABLED=1 "$NPM" run build
+)
+test -f "$BUILD_DIR/.next/standalone/server.js"
+test -f "$BUILD_DIR/custom-server.js"
+
+RUNTIME_DIR="$BUILD_DIR/.runtime"
+cp -a "$BUILD_DIR/.next/standalone" "$RUNTIME_DIR"
+cp "$BUILD_DIR/custom-server.js" "$RUNTIME_DIR/custom-server.js"
+cp -a "$BUILD_DIR/open-sse" "$RUNTIME_DIR/open-sse"
+mkdir -p "$RUNTIME_DIR/src"
+cp -a "$BUILD_DIR/src/mitm" "$RUNTIME_DIR/src/mitm"
+mkdir -p "$RUNTIME_DIR/node_modules/node-forge" "$RUNTIME_DIR/node_modules/next"
+cp -a "$BUILD_DIR/node_modules/node-forge/." "$RUNTIME_DIR/node_modules/node-forge/"
+cp -a "$BUILD_DIR/node_modules/next/." "$RUNTIME_DIR/node_modules/next/"
+"$NODE" --check "$RUNTIME_DIR/custom-server.js"
+"$NODE" --check "$RUNTIME_DIR/server.js"
+
+rm -rf -- "$PREVIOUS_DIR"
+"$SYSTEMCTL" stop 9router 2>/dev/null || true
+if [[ -e "$ROOT" ]]; then
+  mv "$ROOT" "$PREVIOUS_DIR"
+fi
+mv "$BUILD_DIR" "$ROOT"
+swapped=1
+"$SYSTEMCTL" start 9router
+
+healthy=0
+for _ in {1..30}; do
+  if "$CURL" -fsS --connect-timeout 2 --max-time 3 \
+      -o /dev/null http://127.0.0.1/dashboard; then
+    healthy=1
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$healthy" -eq 1 ]]; then
+  revision="$("$GIT" -C "$ROOT" rev-parse --short HEAD)"
+  rm -rf -- "$PREVIOUS_DIR"
+  echo "9Router 更新成功，版本：$revision"
+  exit 0
+fi
+
+cat >&2 <<EOF
+新版本健康检查失败。旧目录保留在 ${PREVIOUS_DIR}。
+检查：journalctl -u 9router -n 100 --no-pager
+人工恢复：systemctl stop 9router && rm -rf $ROOT && mv $PREVIOUS_DIR $ROOT && systemctl start 9router
+EOF
+exit 1

@@ -39,6 +39,10 @@ make_fakes() {
   cat >"$TMP/bin/git" <<'EOF'
 #!/usr/bin/env bash
 set -eu
+if [[ "$1" == -C ]]; then
+  printf 'test-revision\n'
+  exit 0
+fi
 if [[ "$1" != clone ]]; then
   echo "unexpected git command: $*" >&2
   exit 64
@@ -48,9 +52,18 @@ mkdir -p "$dest"
 printf '{"scripts":{"build":"next build"}}\n' >"$dest/package.json"
 EOF
 
+  cat >"$TMP/bin/flock" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
   cat >"$TMP/bin/npm" <<'EOF'
 #!/usr/bin/env bash
 set -eu
+if [[ "$1" == ci ]]; then
+  printf 'npm ci\n' >>"$NINEROUTER_TEST_NPM_LOG"
+  exit 0
+fi
 if [[ "$1" != run || "$2" != build ]]; then
   echo "unexpected npm command: $*" >&2
   exit 64
@@ -80,7 +93,7 @@ fi
 printf 'ok\n'
 EOF
 
-  chmod +x "$TMP/bin/git" "$TMP/bin/npm" "$TMP/bin/systemctl" "$TMP/bin/curl"
+  chmod +x "$TMP/bin/git" "$TMP/bin/npm" "$TMP/bin/systemctl" "$TMP/bin/curl" "$TMP/bin/flock"
 }
 
 run_updater() {
@@ -98,6 +111,7 @@ run_updater() {
   NINEROUTER_TEST_SYSTEMCTL_LOG="$TMP/systemctl.log" \
   NINEROUTER_TEST_NPM_LOG="$TMP/npm.log" \
   NINEROUTER_TEST_CURL_LOG="$TMP/curl.log" \
+  PATH="$TMP/bin:$PATH" \
   "$@" bash "$UPDATER" >"$output_file" 2>&1
 }
 
@@ -113,6 +127,7 @@ test_successful_update_installs_runtime_and_restarts_service() {
   assert_dir "$TMP/opt/9router/.runtime/open-sse"
   assert_dir "$TMP/opt/9router/.runtime/src/mitm"
   assert_not_exists "$TMP/opt/9router.previous"
+  grep -q '^npm ci$' "$TMP/npm.log" || fail 'dependencies were not installed with npm ci'
   grep -q '^stop 9router$' "$TMP/systemctl.log" || fail 'service was not stopped'
   grep -q '^start 9router$' "$TMP/systemctl.log" || fail 'service was not started'
   cleanup
