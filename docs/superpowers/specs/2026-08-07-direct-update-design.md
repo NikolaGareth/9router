@@ -30,13 +30,13 @@
 
 ## 运行方式
 
-systemd 使用固定的 Node.js 绝对路径启动 Next.js standalone 产物：
+更新脚本按仓库 `Dockerfile` 的生产布局组装 `.runtime` 目录：以 Next.js standalone 产物为主体，并补齐 `custom-server.js`、`open-sse`、MITM 文件及生产运行所需模块。systemd 使用固定的 Node.js 绝对路径启动仓库的生产入口：
 
 ```text
-/opt/node-v24.15.0-npm/node/bin/node /opt/9router/.next/standalone/server.js
+/opt/node-v24.15.0-npm/node/bin/node /opt/9router/.runtime/custom-server.js
 ```
 
-服务监听 `0.0.0.0:80`，工作目录为 `/opt/9router`，失败时自动重启。环境变量由 systemd 配置提供，不写入 Git 仓库。
+服务监听 `0.0.0.0:80`，工作目录为 `/opt/9router/.runtime`，失败时自动重启。环境变量由 systemd 配置提供，不写入 Git 仓库。该入口与仓库 `Dockerfile` 的 `CMD ["node", "custom-server.js"]` 保持一致，避免绕过自定义服务器中的真实客户端 IP 处理与后台令牌刷新逻辑。
 
 ## 失败处理
 
