@@ -12,29 +12,121 @@ SYSTEMCTL="${NINEROUTER_SYSTEMCTL:-/usr/bin/systemctl}"
 CURL="${NINEROUTER_CURL:-/usr/bin/curl}"
 REPOSITORY="https://github.com/NikolaGareth/9router.git"
 BRANCH="master"
+HEALTH_URL="http://127.0.0.1/dashboard"
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+normalize_path() {
+  local label="$1"
+  local candidate="$2"
+  local component
+  local normalized=""
+  local -a components
+
+  [[ "$candidate" =~ ^(/[A-Za-z0-9._-]+)+$ ]] ||
+    die "$label 路径必须是仅含安全字符的绝对规范路径：$candidate"
+  IFS=/ read -r -a components <<< "${candidate#/}"
+  for component in "${components[@]}"; do
+    [[ "$component" != . && "$component" != .. ]] ||
+      die "$label 路径不得包含别名组件：$candidate"
+    normalized+="/$component"
+    [[ ! -L "$normalized" ]] ||
+      die "$label 路径不得经过符号链接：$candidate"
+  done
+
+  case "$normalized" in
+    /|/opt|/root|/root/.9router|/root/.9router/*)
+      die "拒绝危险或数据目录路径：$candidate"
+      ;;
+  esac
+  printf '%s\n' "$normalized"
+}
+
+paths_overlap() {
+  local first="$1"
+  local second="$2"
+  [[ "$first" == "$second" || "$first" == "$second/"* || "$second" == "$first/"* ]]
+}
+
+ROOT="$(normalize_path ROOT "$ROOT")"
+BUILD_DIR="$(normalize_path BUILD_DIR "$BUILD_DIR")"
+PREVIOUS_DIR="$(normalize_path PREVIOUS_DIR "$PREVIOUS_DIR")"
+if paths_overlap "$ROOT" "$BUILD_DIR" ||
+  paths_overlap "$ROOT" "$PREVIOUS_DIR" ||
+  paths_overlap "$BUILD_DIR" "$PREVIOUS_DIR"; then
+  die "部署目录不得相同或互为祖先子孙目录"
+fi
 
 mkdir -p "$(dirname "$LOCK_FILE")"
 exec 9>"$LOCK_FILE"
 flock -n 9 || { echo "已有 9Router 更新正在执行" >&2; exit 1; }
 
-for path in "$ROOT" "$BUILD_DIR" "$PREVIOUS_DIR"; do
-  [[ "$path" == /* ]] || { echo "部署路径必须是绝对路径：$path" >&2; exit 1; }
-  case "$path" in
-    /|/opt|/root) echo "拒绝危险部署路径：$path" >&2; exit 1 ;;
-  esac
-done
-[[ "$ROOT" != "$BUILD_DIR" && "$ROOT" != "$PREVIOUS_DIR" && "$BUILD_DIR" != "$PREVIOUS_DIR" ]] || {
-  echo "部署目录必须互不相同" >&2
-  exit 1
-}
+if [[ -e "$PREVIOUS_DIR" || -L "$PREVIOUS_DIR" ]]; then
+  die "检测到已有旧版本目录，拒绝更新以保留人工恢复状态：$PREVIOUS_DIR"
+fi
 
+phase="preparing"
 swapped=0
-cleanup_build() {
-  if [[ "$swapped" -eq 0 && -e "$BUILD_DIR" ]]; then
-    rm -rf -- "$BUILD_DIR"
+had_existing_root=0
+
+report_failure() {
+  local exit_code="$1"
+
+  printf '9Router 更新失败（退出码 %s，阶段：%s）。\n' "$exit_code" "$phase" >&2
+  case "$phase" in
+    preparing)
+      printf '目录切换尚未开始，正式目录未被本脚本移动。\n' >&2
+      ;;
+    stopped)
+      printf '服务已停止，目录切换尚未开始。\n' >&2
+      ;;
+    old-preserved)
+      printf '旧版本已移至 previous，新版本尚未完全启动。\n' >&2
+      ;;
+    new-deployed|new-started)
+      printf '新版本已位于正式目录，服务启动或健康检查未完成。\n' >&2
+      ;;
+  esac
+  if [[ "$swapped" -eq 1 ]]; then
+    printf '构建目录已成为正式目录，trap 不会删除它。\n' >&2
+  fi
+
+  if [[ -e "$PREVIOUS_DIR" ]]; then
+    if [[ -e "$ROOT" ]]; then
+      printf '旧版本保留在 %q。\n' "$PREVIOUS_DIR" >&2
+      printf '人工恢复：systemctl stop 9router && rm -rf -- %q && mv -- %q %q && systemctl start 9router\n' \
+        "$ROOT" "$PREVIOUS_DIR" "$ROOT" >&2
+    else
+      printf '旧版本保留在 %q，正式目录当前不存在。\n' "$PREVIOUS_DIR" >&2
+      printf '人工恢复：mv -- %q %q && systemctl start 9router\n' \
+        "$PREVIOUS_DIR" "$ROOT" >&2
+    fi
+  else
+    printf '未发现可恢复的旧版本目录，未生成恢复命令。\n' >&2
+  fi
+
+  if [[ -e "$ROOT" ]]; then
+    printf '当前正式目录：%q\n' "$ROOT" >&2
+  fi
+  if [[ -e "$BUILD_DIR" ]]; then
+    printf '构建目录保留在：%q\n' "$BUILD_DIR" >&2
   fi
 }
-trap cleanup_build EXIT
+
+on_exit() {
+  local exit_code="$?"
+  trap - EXIT INT TERM
+  if [[ "$exit_code" -ne 0 ]]; then
+    report_failure "$exit_code"
+  fi
+  exit "$exit_code"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 rm -rf -- "$BUILD_DIR"
 "$GIT" clone --depth 1 --branch "$BRANCH" "$REPOSITORY" "$BUILD_DIR"
@@ -50,43 +142,64 @@ RUNTIME_DIR="$BUILD_DIR/.runtime"
 cp -a "$BUILD_DIR/.next/standalone" "$RUNTIME_DIR"
 cp "$BUILD_DIR/custom-server.js" "$RUNTIME_DIR/custom-server.js"
 cp -a "$BUILD_DIR/open-sse" "$RUNTIME_DIR/open-sse"
-mkdir -p "$RUNTIME_DIR/src"
-cp -a "$BUILD_DIR/src/mitm" "$RUNTIME_DIR/src/mitm"
+mkdir -p "$RUNTIME_DIR/src/mitm"
+cp -a "$BUILD_DIR/src/mitm/." "$RUNTIME_DIR/src/mitm/"
 mkdir -p "$RUNTIME_DIR/node_modules/node-forge" "$RUNTIME_DIR/node_modules/next"
 cp -a "$BUILD_DIR/node_modules/node-forge/." "$RUNTIME_DIR/node_modules/node-forge/"
 cp -a "$BUILD_DIR/node_modules/next/." "$RUNTIME_DIR/node_modules/next/"
 "$NODE" --check "$RUNTIME_DIR/custom-server.js"
 "$NODE" --check "$RUNTIME_DIR/server.js"
 
-rm -rf -- "$PREVIOUS_DIR"
-"$SYSTEMCTL" stop 9router 2>/dev/null || true
 if [[ -e "$ROOT" ]]; then
-  mv "$ROOT" "$PREVIOUS_DIR"
+  had_existing_root=1
+  if ! "$SYSTEMCTL" stop 9router; then
+    die "停止 9Router 服务失败，拒绝切换目录"
+  fi
+  phase="stopped"
+  if "$SYSTEMCTL" is-active --quiet 9router; then
+    die "9Router 服务仍处于活动状态，拒绝切换目录"
+  fi
+  mv -- "$ROOT" "$PREVIOUS_DIR"
+  phase="old-preserved"
 fi
-mv "$BUILD_DIR" "$ROOT"
+
+mv -- "$BUILD_DIR" "$ROOT"
 swapped=1
+phase="new-deployed"
 "$SYSTEMCTL" start 9router
+phase="new-started"
 
 healthy=0
 for _ in {1..30}; do
-  if "$CURL" -fsS --connect-timeout 2 --max-time 3 \
-      -o /dev/null http://127.0.0.1/dashboard; then
-    healthy=1
-    break
+  if "$SYSTEMCTL" is-active --quiet 9router; then
+    health_response="$("$CURL" -sS --connect-timeout 2 --max-time 3 \
+      -o /dev/null -w '%{http_code} %{redirect_url}' "$HEALTH_URL")" || health_response=""
+    http_status="${health_response%% *}"
+    redirect_target="${health_response#* }"
+    case "$http_status" in
+      2??)
+        healthy=1
+        break
+        ;;
+      301|302|303|307|308)
+        case "$redirect_target" in
+          /login|/login\?*|http://127.0.0.1/login|http://127.0.0.1/login\?*)
+            healthy=1
+            break
+            ;;
+        esac
+        ;;
+    esac
   fi
   sleep 1
 done
 
-if [[ "$healthy" -eq 1 ]]; then
-  revision="$("$GIT" -C "$ROOT" rev-parse --short HEAD)"
-  rm -rf -- "$PREVIOUS_DIR"
-  echo "9Router 更新成功，版本：$revision"
-  exit 0
+if [[ "$healthy" -ne 1 ]]; then
+  exit 1
 fi
 
-cat >&2 <<EOF
-新版本健康检查失败。旧目录保留在 ${PREVIOUS_DIR}。
-检查：journalctl -u 9router -n 100 --no-pager
-人工恢复：systemctl stop 9router && rm -rf $ROOT && mv $PREVIOUS_DIR $ROOT && systemctl start 9router
-EOF
-exit 1
+revision="$("$GIT" -C "$ROOT" rev-parse --short HEAD)"
+if [[ "$had_existing_root" -eq 1 ]]; then
+  rm -rf -- "$PREVIOUS_DIR"
+fi
+printf '9Router 更新成功，版本：%s\n' "$revision"
