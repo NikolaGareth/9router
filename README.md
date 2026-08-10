@@ -88,6 +88,33 @@ Cursor、Cline、Continue、Roo Code 等客户端均可使用此配置。
 
 ## 部署
 
+### Ubuntu 直接部署
+
+适用于直接管理云主机的场景。部署脚本会安装 systemd 服务和 `9router-update`，服务监听 `80` 端口，数据持久化在 `/root/.9router`。
+
+前置条件：Ubuntu、Git、curl、flock，以及固定 Node.js 路径 `/opt/node-v24.15.0-npm/node/bin/node` 已存在；`80` 端口不能被其他程序占用。
+
+先将仓库克隆到临时管理目录，再从仓库根目录执行首次安装：
+
+```bash
+git clone https://github.com/NikolaGareth/9router.git /tmp/9router-admin
+cd /tmp/9router-admin
+sudo bash deploy/linux/install.sh
+```
+
+日常更新直接执行：
+
+```bash
+sudo 9router-update
+systemctl status 9router --no-pager
+curl -I http://127.0.0.1/dashboard
+journalctl -u 9router -n 100 --no-pager
+```
+
+`9router-update` 仅在成功退出后才会删除上一个临时部署目录 `/opt/9router.previous`。更新失败时会保留切换现场，不会输出可脱离锁执行的 `rm` 或 `mv` 恢复命令。
+
+若脚本输出「人工联合恢复：`/run/9router-install-recover`」，请在确认现场后按该路径执行脚本；若输出「首次安装安全收尾：`/run/9router-install-cleanup`」，同样按输出路径执行收尾脚本。两类脚本都会校验锁和现场，不能用旧版手工恢复命令替代。相关恢复材料位于 `/run`，重启后会丢失；必须在重启前处理或保留现场并人工核对。
+
 ### systemd
 
 先确认全局命令的绝对路径：
