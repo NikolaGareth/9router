@@ -18,7 +18,8 @@ fail() {
 }
 
 new_tmp() {
-  TMP="$(mktemp -d "$ROOT_DIR/.9router-update-test.XXXXXX")"
+  mkdir -p "$ROOT_DIR/.superpowers"
+  TMP="$(mktemp -d "$ROOT_DIR/.superpowers/9router-update-test.XXXXXX")"
 }
 
 assert_file() {
@@ -204,14 +205,24 @@ EOF
 exit 0
 EOF
 
+  for command_name in mkdir rm cp; do
+    cat >"$TMP/bin/$command_name" <<EOF
+#!/usr/bin/env bash
+exec /bin/$command_name "\$@"
+EOF
+  done
+
   chmod +x "$TMP/bin/git" "$TMP/bin/flock" "$TMP/bin/npm" "$TMP/bin/node" "$TMP/bin/stat" \
-    "$TMP/bin/mv" "$TMP/bin/systemctl" "$TMP/bin/curl" "$TMP/bin/sleep"
+    "$TMP/bin/mv" "$TMP/bin/systemctl" "$TMP/bin/curl" "$TMP/bin/sleep" \
+    "$TMP/bin/mkdir" "$TMP/bin/rm" "$TMP/bin/cp"
 }
 
 run_updater() {
   local output_file="$1"
   shift
   env \
+    NINEROUTER_TEST_MODE=1 \
+    NINEROUTER_TEST_ROOT="$TMP" \
     NINEROUTER_ROOT="$TMP/opt/9router" \
     NINEROUTER_BUILD_DIR="$TMP/opt/9router-build" \
     NINEROUTER_PREVIOUS_DIR="$TMP/opt/9router.previous" \
@@ -221,6 +232,9 @@ run_updater() {
     NINEROUTER_STAT="$TMP/bin/stat" \
     NINEROUTER_FLOCK="$TMP/bin/flock" \
     NINEROUTER_SLEEP="$TMP/bin/sleep" \
+    NINEROUTER_MKDIR="$TMP/bin/mkdir" \
+    NINEROUTER_RM="$TMP/bin/rm" \
+    NINEROUTER_CP="$TMP/bin/cp" \
     NINEROUTER_NPM="$TMP/bin/npm" \
     NINEROUTER_SYSTEMCTL="$TMP/bin/systemctl" \
     NINEROUTER_CURL="$TMP/bin/curl" \
@@ -380,6 +394,18 @@ test_cross_filesystem_deployment_aborts_before_stop() {
   TMP=""
 }
 
+test_first_install_cross_filesystem_aborts_before_start() {
+  new_tmp
+  make_fakes
+  if run_updater "$TMP/output" env NINEROUTER_TEST_CROSS_DEVICE=1; then
+    fail 'first install accepted build and destination on different devices'
+  fi
+  assert_not_exists "$TMP/opt/9router"
+  assert_empty_file "$TMP/systemctl.log"
+  cleanup
+  TMP=""
+}
+
 test_build_and_node_check_failures_do_not_stop_service() {
   new_tmp
   make_fakes
@@ -528,6 +554,7 @@ test_rejects_unsafe_or_overlapping_lock_before_opening_it
 test_existing_previous_refuses_update_without_deletion
 test_stop_failure_and_active_service_abort_before_switch
 test_cross_filesystem_deployment_aborts_before_stop
+test_first_install_cross_filesystem_aborts_before_start
 test_build_and_node_check_failures_do_not_stop_service
 test_previous_recheck_prevents_racy_nested_move
 test_lock_contention_prevents_mutation
