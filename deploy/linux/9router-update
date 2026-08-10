@@ -1,16 +1,47 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ROOT="${NINEROUTER_ROOT:-/opt/9router}"
-BUILD_DIR="${NINEROUTER_BUILD_DIR:-/opt/9router-build}"
-PREVIOUS_DIR="${NINEROUTER_PREVIOUS_DIR:-/opt/9router.previous}"
-LOCK_FILE="${NINEROUTER_LOCK_FILE:-/run/9router-update.lock}"
-GIT="${NINEROUTER_GIT:-/usr/bin/git}"
-NPM="${NINEROUTER_NPM:-/opt/node-v24.15.0-npm/node/bin/npm}"
-NODE="${NINEROUTER_NODE:-/opt/node-v24.15.0-npm/node/bin/node}"
-SYSTEMCTL="${NINEROUTER_SYSTEMCTL:-/usr/bin/systemctl}"
-CURL="${NINEROUTER_CURL:-/usr/bin/curl}"
-MV="${NINEROUTER_MV:-/bin/mv}"
+if [[ "$EUID" -eq 0 ]]; then
+  for override in ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE GIT NPM NODE SYSTEMCTL CURL MV STAT FLOCK MKDIR RM CP SLEEP; do
+    [[ -z "${!override+x}" ]] || {
+      printf 'root 环境拒绝 NINEROUTER_%s 覆盖\n' "$override" >&2
+      exit 1
+    }
+  done
+  ROOT=/opt/9router
+  BUILD_DIR=/opt/9router-build
+  PREVIOUS_DIR=/opt/9router.previous
+  LOCK_FILE=/run/9router-update.lock
+  GIT=/usr/bin/git
+  NPM=/opt/node-v24.15.0-npm/node/bin/npm
+  NODE=/opt/node-v24.15.0-npm/node/bin/node
+  SYSTEMCTL=/usr/bin/systemctl
+  CURL=/usr/bin/curl
+  MV=/bin/mv
+  STAT=/usr/bin/stat
+  FLOCK=/usr/bin/flock
+  MKDIR=/bin/mkdir
+  RM=/bin/rm
+  CP=/bin/cp
+  SLEEP=/bin/sleep
+else
+  ROOT="${NINEROUTER_ROOT:-/opt/9router}"
+  BUILD_DIR="${NINEROUTER_BUILD_DIR:-/opt/9router-build}"
+  PREVIOUS_DIR="${NINEROUTER_PREVIOUS_DIR:-/opt/9router.previous}"
+  LOCK_FILE="${NINEROUTER_LOCK_FILE:-/run/9router-update.lock}"
+  GIT="${NINEROUTER_GIT:-/usr/bin/git}"
+  NPM="${NINEROUTER_NPM:-/opt/node-v24.15.0-npm/node/bin/npm}"
+  NODE="${NINEROUTER_NODE:-/opt/node-v24.15.0-npm/node/bin/node}"
+  SYSTEMCTL="${NINEROUTER_SYSTEMCTL:-/usr/bin/systemctl}"
+  CURL="${NINEROUTER_CURL:-/usr/bin/curl}"
+  MV="${NINEROUTER_MV:-/bin/mv}"
+  STAT="${NINEROUTER_STAT:-/usr/bin/stat}"
+  FLOCK="${NINEROUTER_FLOCK:-/usr/bin/flock}"
+  MKDIR="${NINEROUTER_MKDIR:-/bin/mkdir}"
+  RM="${NINEROUTER_RM:-/bin/rm}"
+  CP="${NINEROUTER_CP:-/bin/cp}"
+  SLEEP="${NINEROUTER_SLEEP:-/bin/sleep}"
+fi
 REPOSITORY="https://github.com/NikolaGareth/9router.git"
 BRANCH="master"
 HEALTH_URL="http://127.0.0.1/dashboard"
@@ -65,9 +96,18 @@ if paths_overlap "$ROOT" "$BUILD_DIR" ||
   die "部署目录不得相同或互为祖先子孙目录"
 fi
 
-mkdir -p "$(dirname "$LOCK_FILE")"
-exec 9>"$LOCK_FILE"
-flock -n 9 || { echo "已有 9Router 更新正在执行" >&2; exit 1; }
+LOCK_PARENT="${LOCK_FILE%/*}"
+if [[ -e "$LOCK_PARENT" && ! -d "$LOCK_PARENT" ]]; then
+  die "锁文件父路径不是目录：$LOCK_PARENT"
+fi
+"$MKDIR" -p "$LOCK_PARENT"
+[[ -d "$LOCK_PARENT" && ! -L "$LOCK_PARENT" ]] ||
+  die "锁文件父目录不安全：$LOCK_PARENT"
+if [[ -L "$LOCK_FILE" || ( -e "$LOCK_FILE" && ! -f "$LOCK_FILE" ) ]]; then
+  die "锁文件必须为不存在或普通文件：$LOCK_FILE"
+fi
+exec 9>>"$LOCK_FILE"
+"$FLOCK" -n 9 || { echo "已有 9Router 更新正在执行" >&2; exit 1; }
 
 if [[ -e "$PREVIOUS_DIR" || -L "$PREVIOUS_DIR" ]]; then
   die "检测到已有旧版本目录，拒绝更新以保留人工恢复状态：$PREVIOUS_DIR"
@@ -87,6 +127,31 @@ service_is_explicitly_stopped() {
     status=$?
   fi
   [[ "$status" -eq 3 && ( "$state" == inactive || "$state" == failed ) ]]
+}
+
+device_for_path() {
+  local probe="$1"
+
+  while [[ ! -e "$probe" ]]; do
+    probe="${probe%/*}"
+    [[ -n "$probe" ]] || return 1
+  done
+  "$STAT" -c %d -- "$probe"
+}
+
+ensure_deployment_same_device() {
+  local root_device
+  local build_device
+  local previous_device
+
+  root_device="$(device_for_path "$ROOT")" ||
+    die "无法读取 ROOT 所在设备"
+  build_device="$(device_for_path "$BUILD_DIR")" ||
+    die "无法读取 BUILD 所在设备"
+  previous_device="$(device_for_path "$PREVIOUS_DIR")" ||
+    die "无法读取 PREVIOUS 所在设备"
+  [[ "$root_device" == "$build_device" && "$root_device" == "$previous_device" ]] ||
+    die "ROOT、BUILD 与 PREVIOUS 必须位于同一文件系统"
 }
 
 report_failure() {
@@ -154,7 +219,7 @@ trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-rm -rf -- "$BUILD_DIR"
+"$RM" -rf -- "$BUILD_DIR"
 "$GIT" clone --depth 1 --branch "$BRANCH" "$REPOSITORY" "$BUILD_DIR"
 (
   cd "$BUILD_DIR"
@@ -165,19 +230,21 @@ test -f "$BUILD_DIR/.next/standalone/server.js"
 test -f "$BUILD_DIR/custom-server.js"
 
 RUNTIME_DIR="$BUILD_DIR/.runtime"
-cp -a "$BUILD_DIR/.next/standalone" "$RUNTIME_DIR"
-cp "$BUILD_DIR/custom-server.js" "$RUNTIME_DIR/custom-server.js"
-cp -a "$BUILD_DIR/open-sse" "$RUNTIME_DIR/open-sse"
-mkdir -p "$RUNTIME_DIR/src/mitm"
-cp -a "$BUILD_DIR/src/mitm/." "$RUNTIME_DIR/src/mitm/"
-mkdir -p "$RUNTIME_DIR/node_modules/node-forge" "$RUNTIME_DIR/node_modules/next"
-cp -a "$BUILD_DIR/node_modules/node-forge/." "$RUNTIME_DIR/node_modules/node-forge/"
-cp -a "$BUILD_DIR/node_modules/next/." "$RUNTIME_DIR/node_modules/next/"
+"$CP" -a "$BUILD_DIR/.next/standalone" "$RUNTIME_DIR"
+"$CP" "$BUILD_DIR/custom-server.js" "$RUNTIME_DIR/custom-server.js"
+"$MKDIR" -p "$RUNTIME_DIR/open-sse"
+"$CP" -a "$BUILD_DIR/open-sse/." "$RUNTIME_DIR/open-sse/"
+"$MKDIR" -p "$RUNTIME_DIR/src/mitm"
+"$CP" -a "$BUILD_DIR/src/mitm/." "$RUNTIME_DIR/src/mitm/"
+"$MKDIR" -p "$RUNTIME_DIR/node_modules/node-forge" "$RUNTIME_DIR/node_modules/next"
+"$CP" -a "$BUILD_DIR/node_modules/node-forge/." "$RUNTIME_DIR/node_modules/node-forge/"
+"$CP" -a "$BUILD_DIR/node_modules/next/." "$RUNTIME_DIR/node_modules/next/"
 "$NODE" --check "$RUNTIME_DIR/custom-server.js"
 "$NODE" --check "$RUNTIME_DIR/server.js"
 
 if [[ -e "$ROOT" ]]; then
   had_existing_root=1
+  ensure_deployment_same_device
   phase="stopping-in-progress"
   if ! "$SYSTEMCTL" stop 9router; then
     die "停止 9Router 服务失败，拒绝切换目录"
@@ -230,7 +297,7 @@ for _ in {1..30}; do
         ;;
     esac
   fi
-  sleep 1
+  "$SLEEP" 1
 done
 
 if [[ "$healthy" -ne 1 ]]; then
@@ -239,6 +306,6 @@ fi
 
 revision="$("$GIT" -C "$ROOT" rev-parse --short HEAD)"
 if [[ "$had_existing_root" -eq 1 ]]; then
-  rm -rf -- "$PREVIOUS_DIR"
+  "$RM" -rf -- "$PREVIOUS_DIR"
 fi
 printf '9Router 更新成功，版本：%s\n' "$revision"

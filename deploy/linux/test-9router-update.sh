@@ -85,10 +85,26 @@ printf 'npm run build\n' >>"$NINEROUTER_TEST_NPM_LOG"
 if [[ "${NINEROUTER_TEST_BUILD_FAIL:-0}" == 1 ]]; then
   exit 42
 fi
-mkdir -p .next/standalone node_modules/node-forge node_modules/next src/mitm open-sse
+mkdir -p .next/standalone/src/mitm .next/standalone/open-sse \
+  node_modules/node-forge node_modules/next src/mitm open-sse
 : >.next/standalone/server.js
+: >.next/standalone/src/mitm/server.js
+: >.next/standalone/open-sse/standalone-marker
 : >custom-server.js
-: >src/mitm/server.js
+: >src/mitm/runtime-helper.js
+: >open-sse/source-marker
+EOF
+
+  cat >"$TMP/bin/stat" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+for argument in "$@"; do
+  if [[ "${NINEROUTER_TEST_CROSS_DEVICE:-0}" == 1 && "$argument" == *9router-build* ]]; then
+    printf '2\n'
+    exit 0
+  fi
+done
+printf '1\n'
 EOF
 
   cat >"$TMP/bin/node" <<'EOF'
@@ -188,7 +204,7 @@ EOF
 exit 0
 EOF
 
-  chmod +x "$TMP/bin/git" "$TMP/bin/flock" "$TMP/bin/npm" "$TMP/bin/node" \
+  chmod +x "$TMP/bin/git" "$TMP/bin/flock" "$TMP/bin/npm" "$TMP/bin/node" "$TMP/bin/stat" \
     "$TMP/bin/mv" "$TMP/bin/systemctl" "$TMP/bin/curl" "$TMP/bin/sleep"
 }
 
@@ -202,6 +218,9 @@ run_updater() {
     NINEROUTER_LOCK_FILE="$TMP/run/9router-update.lock" \
     NINEROUTER_GIT="$TMP/bin/git" \
     NINEROUTER_MV="$TMP/bin/mv" \
+    NINEROUTER_STAT="$TMP/bin/stat" \
+    NINEROUTER_FLOCK="$TMP/bin/flock" \
+    NINEROUTER_SLEEP="$TMP/bin/sleep" \
     NINEROUTER_NPM="$TMP/bin/npm" \
     NINEROUTER_SYSTEMCTL="$TMP/bin/systemctl" \
     NINEROUTER_CURL="$TMP/bin/curl" \
@@ -222,6 +241,7 @@ test_successful_update_installs_flat_runtime_and_restarts_service() {
   make_fakes
   mkdir -p "$TMP/opt/9router"
   : >"$TMP/opt/9router/current-marker"
+  printf 'lock-sentinel\n' >"$TMP/run/9router-update.lock"
   if ! run_updater "$TMP/output"; then
     fail 'updater failed during the successful update scenario'
   fi
@@ -229,10 +249,16 @@ test_successful_update_installs_flat_runtime_and_restarts_service() {
   assert_file "$TMP/opt/9router/.runtime/custom-server.js"
   assert_file "$TMP/opt/9router/.runtime/server.js"
   assert_dir "$TMP/opt/9router/.runtime/open-sse"
+  assert_file "$TMP/opt/9router/.runtime/open-sse/standalone-marker"
+  assert_file "$TMP/opt/9router/.runtime/open-sse/source-marker"
+  assert_not_exists "$TMP/opt/9router/.runtime/open-sse/open-sse"
   assert_dir "$TMP/opt/9router/.runtime/src/mitm"
   assert_file "$TMP/opt/9router/.runtime/src/mitm/server.js"
+  assert_file "$TMP/opt/9router/.runtime/src/mitm/runtime-helper.js"
   assert_not_exists "$TMP/opt/9router/.runtime/src/mitm/mitm"
   assert_not_exists "$TMP/opt/9router.previous"
+  grep -Fqx 'lock-sentinel' "$TMP/run/9router-update.lock" || \
+    fail 'existing lock file was truncated'
   grep -q '^npm ci$' "$TMP/npm.log" || fail 'dependencies were not installed with npm ci'
   grep -q '^stop 9router$' "$TMP/systemctl.log" || fail 'service was not stopped'
   grep -q '^is-active --quiet 9router$' "$TMP/systemctl.log" || fail 'service activity was not checked'
@@ -335,6 +361,21 @@ test_stop_failure_and_active_service_abort_before_switch() {
   fi
   assert_file "$TMP/opt/9router/current-marker"
   assert_not_exists "$TMP/opt/9router.previous"
+  cleanup
+  TMP=""
+}
+
+test_cross_filesystem_deployment_aborts_before_stop() {
+  new_tmp
+  make_fakes
+  mkdir -p "$TMP/opt/9router"
+  : >"$TMP/opt/9router/current-marker"
+  if run_updater "$TMP/output" env NINEROUTER_TEST_CROSS_DEVICE=1; then
+    fail 'updater accepted root, build, and previous on different devices'
+  fi
+  assert_file "$TMP/opt/9router/current-marker"
+  assert_not_exists "$TMP/opt/9router.previous"
+  assert_empty_file "$TMP/systemctl.log"
   cleanup
   TMP=""
 }
@@ -486,6 +527,7 @@ test_rejects_unsafe_data_overlapping_and_symlink_paths
 test_rejects_unsafe_or_overlapping_lock_before_opening_it
 test_existing_previous_refuses_update_without_deletion
 test_stop_failure_and_active_service_abort_before_switch
+test_cross_filesystem_deployment_aborts_before_stop
 test_build_and_node_check_failures_do_not_stop_service
 test_previous_recheck_prevents_racy_nested_move
 test_lock_contention_prevents_mutation
