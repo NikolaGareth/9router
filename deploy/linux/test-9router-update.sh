@@ -54,6 +54,18 @@ assert_event_log() {
     fail "unexpected installer event order:\nexpected:\n$expected\nactual:\n$actual"
 }
 
+run_fake_systemctl() {
+  env \
+    NINEROUTER_TEST_SYSTEMCTL_LOG="$TMP/systemctl.log" \
+    NINEROUTER_TEST_INSTALL_EVENTS="$TMP/install-events.log" \
+    NINEROUTER_TEST_SYSTEMCTL_STATE="$TMP/systemctl.state" \
+    NINEROUTER_TEST_SYSTEMCTL_ENABLED_STATE="$TMP/systemctl.enabled" \
+    NINEROUTER_TEST_SYSTEMCTL_WANTS_LINK="$TMP/systemctl.wants-link" \
+    NINEROUTER_TEST_PREVIOUS_DIR="$TMP/opt/9router.previous" \
+    NINEROUTER_TEST_DAEMON_RELOAD_MARKER="$TMP/daemon-reload.failed" \
+    "$TMP/bin/systemctl" "$@"
+}
+
 test_service_unit_uses_fixed_production_paths_without_credentials() {
   assert_file "$SERVICE_UNIT"
   grep -q '^ExecStart=/opt/node-v24.15.0-npm/node/bin/node /opt/9router/.runtime/custom-server.js$' "$SERVICE_UNIT" || \
@@ -85,6 +97,7 @@ make_fakes() {
   : >"$TMP/git.log"
   : >"$TMP/flock.log"
   : >"$TMP/install-events.log"
+  : >"$TMP/phase.log"
   printf 'active\n' >"$TMP/systemctl.state"
   printf '%s\n' "${NINEROUTER_TEST_INITIAL_ENABLED_STATE:-enabled}" >"$TMP/systemctl.enabled"
   : >"$TMP/systemctl.wants-link"
@@ -201,16 +214,35 @@ case "$1" in
     ;;
   mask)
     [[ "$2" == 9router ]]
+    if [[ "${NINEROUTER_TEST_REALISTIC_MASK:-0}" == 1 ]]; then
+      if [[ -L "$NINEROUTER_SERVICE_TARGET" && \
+        "$(readlink "$NINEROUTER_SERVICE_TARGET")" == /dev/null ]]; then
+        :
+      elif [[ -e "$NINEROUTER_SERVICE_TARGET" || -L "$NINEROUTER_SERVICE_TARGET" ]]; then
+        exit 9
+      else
+        ln -s /dev/null "$NINEROUTER_SERVICE_TARGET"
+      fi
+    fi
     printf 'masked\n' >"$NINEROUTER_TEST_SYSTEMCTL_ENABLED_STATE"
     rm -f -- "$NINEROUTER_TEST_SYSTEMCTL_WANTS_LINK"
     ;;
   is-enabled)
     [[ "$2" == 9router ]]
+    if [[ "${NINEROUTER_TEST_IS_ENABLED_QUERY_ERROR_WITH_STATE:-0}" == 1 ]]; then
+      printf 'enabled\n'
+      exit 5
+    fi
+    if [[ "${NINEROUTER_TEST_IS_ENABLED_QUERY_ERROR:-0}" == 1 ]]; then
+      printf 'Failed to query unit state\n' >&2
+      exit 5
+    fi
     state="$(cat "$NINEROUTER_TEST_SYSTEMCTL_ENABLED_STATE")"
     printf '%s\n' "$state"
     case "$state" in
       enabled) exit 0 ;;
-      disabled|masked|not-found) exit 1 ;;
+      disabled|masked) exit 1 ;;
+      not-found) exit 4 ;;
       *) exit 3 ;;
     esac
     ;;
@@ -301,8 +333,19 @@ EOF
 #!/usr/bin/env bash
 set -eu
 source_path="${@: -2:1}"
-if [[ "$source_path" == *'/9router.service' ]]; then
+destination_path="${@: -1}"
+if [[ -n "${NINEROUTER_UPDATER_TARGET:-}" && "$source_path" == "$NINEROUTER_UPDATER_TARGET" ]]; then
+  printf 'cp backup-updater\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS"
+  if [[ "${NINEROUTER_TEST_CP_FAIL:-}" == updater ]]; then
+    printf 'partial-updater-backup\n' >"$destination_path"
+    exit 77
+  fi
+elif [[ -n "${NINEROUTER_SERVICE_TARGET:-}" && "$source_path" == "$NINEROUTER_SERVICE_TARGET" ]]; then
   printf 'cp backup-unit\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS"
+  if [[ "${NINEROUTER_TEST_CP_FAIL:-}" == unit ]]; then
+    printf 'partial-unit-backup\n' >"$destination_path"
+    exit 78
+  fi
 fi
 if [[ "$1" == -a ]]; then
   shift
@@ -319,10 +362,23 @@ while [[ "$1" == -T || "$1" == -n || "$1" == -f || "$1" == -fT || "$1" == -- ]];
 done
 source_path="$1"
 destination_path="$2"
+if [[ -n "${NINEROUTER_PHASE_FILE:-}" && "$destination_path" == "$NINEROUTER_PHASE_FILE" ]]; then
+  phase_value="$(cat "$source_path")"
+  printf '%s\n' "$phase_value" >>"$NINEROUTER_TEST_PHASE_LOG"
+  if [[ "${NINEROUTER_TEST_FAIL_PHASE:-}" == "$phase_value" ]]; then
+    exit 79
+  fi
+fi
 case "$source_path" in
   *9router.service.new.*) printf 'mv install-unit\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS" ;;
   *9router.service.backup.*) printf 'mv restore-unit\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS" ;;
+  */9router-install-recovery.unit) printf 'mv restore-unit\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS" ;;
 esac
+if [[ "${NINEROUTER_TEST_FAIL_OLD_MOVE_AFTER_MUTATION:-0}" == 1 && \
+  "$source_path" == "$NINEROUTER_ROOT" && "$destination_path" == "$NINEROUTER_PREVIOUS_DIR" ]]; then
+  /bin/mv "$source_path" "$destination_path"
+  exit 73
+fi
 if [[ -e "$destination_path" || -L "$destination_path" ]]; then
   /bin/mv -f "$source_path" "$destination_path"
 else
@@ -335,6 +391,10 @@ EOF
 set -eu
 for argument in "$@"; do
   if [[ "$argument" == *9router.service.backup.* ]]; then
+    printf 'rm cleanup-backup\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS"
+    break
+  fi
+  if [[ "$argument" == */9router-install-recovery.unit ]]; then
     printf 'rm cleanup-backup\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS"
     break
   fi
@@ -369,6 +429,7 @@ run_updater() {
     NINEROUTER_BUILD_DIR="$TMP/opt/9router-build" \
     NINEROUTER_PREVIOUS_DIR="$TMP/opt/9router.previous" \
     NINEROUTER_LOCK_FILE="$TMP/run/9router-update.lock" \
+    NINEROUTER_PHASE_FILE="$TMP/run/9router-update.phase" \
     NINEROUTER_GIT="$TMP/bin/git" \
     NINEROUTER_MV="$TMP/bin/mv" \
     NINEROUTER_STAT="$TMP/bin/stat" \
@@ -391,6 +452,7 @@ run_updater() {
     NINEROUTER_TEST_GIT_LOG="$TMP/git.log" \
     NINEROUTER_TEST_FLOCK_LOG="$TMP/flock.log" \
     NINEROUTER_TEST_INSTALL_EVENTS="$TMP/install-events.log" \
+    NINEROUTER_TEST_PHASE_LOG="$TMP/phase.log" \
     NINEROUTER_TEST_DAEMON_RELOAD_MARKER="$TMP/daemon-reload.failed" \
     NINEROUTER_TEST_TERM_GO="$TMP/term-go" \
     PATH="$TMP/bin:$PATH" \
@@ -427,6 +489,10 @@ run_installer() {
     NINEROUTER_BUILD_DIR="$TMP/opt/9router-build" \
     NINEROUTER_PREVIOUS_DIR="$TMP/opt/9router.previous" \
     NINEROUTER_LOCK_FILE="$TMP/run/9router-update.lock" \
+    NINEROUTER_PHASE_FILE="$TMP/run/9router-update.phase" \
+    NINEROUTER_RECOVERY_UNIT="$TMP/run/9router-install-recovery.unit" \
+    NINEROUTER_RECOVERY_UPDATER="$TMP/run/9router-install-recovery.updater" \
+    NINEROUTER_RECOVERY_ENABLE_STATE="$TMP/run/9router-install-recovery.enable-state" \
     NINEROUTER_MV="$TMP/bin/mv" \
     NINEROUTER_STAT="$TMP/bin/stat" \
     NINEROUTER_SLEEP="$TMP/bin/sleep" \
@@ -442,6 +508,7 @@ run_installer() {
     NINEROUTER_TEST_GIT_LOG="$TMP/git.log" \
     NINEROUTER_TEST_FLOCK_LOG="$TMP/flock.log" \
     NINEROUTER_TEST_INSTALL_EVENTS="$TMP/install-events.log" \
+    NINEROUTER_TEST_PHASE_LOG="$TMP/phase.log" \
     NINEROUTER_TEST_DAEMON_RELOAD_MARKER="$TMP/daemon-reload.failed" \
     PATH="$TMP/bin:$PATH" \
     "$@" bash "$INSTALLER" >"$output_file" 2>&1
@@ -457,6 +524,60 @@ prepare_existing_unit() {
   chmod 0600 "$TMP/etc/systemd/system/9router.service"
   cp "$TMP/etc/systemd/system/9router.service" "$TMP/original-unit"
   printf 'keep-this-data\n' >"$TMP/root/.9router/existing-data"
+}
+
+prepare_existing_updater() {
+  mkdir -p "$TMP/usr/local/sbin"
+  printf '#!/usr/bin/env bash\nprintf old-updater\\n\n' >"$TMP/usr/local/sbin/9router-update"
+  chmod 0700 "$TMP/usr/local/sbin/9router-update"
+  cp "$TMP/usr/local/sbin/9router-update" "$TMP/original-updater"
+}
+
+prepare_legacy_installation() {
+  mkdir -p "$TMP/etc/systemd/system" "$TMP/usr/local/sbin" \
+    "$TMP/opt/9router" "$TMP/root/.9router"
+  cat >"$TMP/opt/9router/legacy-entrypoint" <<EOF
+#!/usr/bin/env bash
+printf 'legacy-entrypoint-ok\\n'
+EOF
+  chmod 0755 "$TMP/opt/9router/legacy-entrypoint"
+  printf '[Service]\nExecStart=%s\n' "$TMP/opt/9router/legacy-entrypoint" \
+    >"$TMP/etc/systemd/system/9router.service"
+  chmod 0600 "$TMP/etc/systemd/system/9router.service"
+  cp "$TMP/etc/systemd/system/9router.service" "$TMP/original-unit"
+  printf '#!/usr/bin/env bash\nprintf legacy-updater-ok\\n\n' \
+    >"$TMP/usr/local/sbin/9router-update"
+  chmod 0700 "$TMP/usr/local/sbin/9router-update"
+  cp "$TMP/usr/local/sbin/9router-update" "$TMP/original-updater"
+  printf 'keep-this-data\n' >"$TMP/root/.9router/existing-data"
+}
+
+prepare_masked_installation() {
+  mkdir -p "$TMP/etc/systemd/system" "$TMP/usr/local/sbin" \
+    "$TMP/opt/9router" "$TMP/root/.9router"
+  rm -f -- "$TMP/etc/systemd/system/9router.service"
+  ln -s /dev/null "$TMP/etc/systemd/system/9router.service"
+  printf '#!/usr/bin/env bash\nprintf masked-old-updater\\n\n' \
+    >"$TMP/usr/local/sbin/9router-update"
+  chmod 0700 "$TMP/usr/local/sbin/9router-update"
+  cp "$TMP/usr/local/sbin/9router-update" "$TMP/original-updater"
+  : >"$TMP/opt/9router/current-marker"
+  printf 'masked\n' >"$TMP/systemctl.enabled"
+  printf 'inactive\n' >"$TMP/systemctl.state"
+  rm -f -- "$TMP/systemctl.wants-link"
+}
+
+assert_old_updater_restored() {
+  cmp "$TMP/original-updater" "$TMP/usr/local/sbin/9router-update" || \
+    fail 'installer did not restore the original updater bytes'
+  [[ "$(file_mode "$TMP/usr/local/sbin/9router-update")" == 700 ]] || \
+    fail 'installer did not restore the original updater permissions'
+}
+
+assert_no_fixed_recovery_materials() {
+  assert_not_exists "$TMP/run/9router-install-recovery.unit"
+  assert_not_exists "$TMP/run/9router-install-recovery.updater"
+  assert_not_exists "$TMP/run/9router-install-recovery.enable-state"
 }
 
 assert_old_unit_restored() {
@@ -497,8 +618,9 @@ test_installer_uses_only_test_paths_and_preserves_existing_data() {
     fail 'installer did not clean its unit backup after success'
   assert_event_log \
     'systemctl is-enabled 9router' \
-    'install updater' \
+    'systemctl is-active --quiet 9router' \
     'cp backup-unit' \
+    'install updater' \
     'install unit' \
     'mv install-unit' \
     'systemctl daemon-reload' \
@@ -529,21 +651,25 @@ test_installer_rolls_back_unit_on_failure() {
       fail "installer succeeded despite $scenario failure"
     fi
     assert_old_unit_restored
-    grep -q '^daemon-reload$' "$TMP/systemctl.log" ||
-      fail "installer did not reload systemd after $scenario rollback"
+    if [[ "$scenario" != unit ]]; then
+      grep -q '^daemon-reload$' "$TMP/systemctl.log" ||
+        fail "installer did not reload systemd after $scenario rollback"
+    fi
     if [[ "$scenario" == updater ]]; then
       assert_event_log \
         'systemctl is-enabled 9router' \
-        'install updater' \
+        'systemctl is-active --quiet 9router' \
         'cp backup-unit' \
+        'install updater' \
         'install unit' \
         'mv install-unit' \
         'systemctl daemon-reload' \
         'systemctl enable 9router' \
         'git clone' \
         'mv restore-unit' \
+        'systemctl daemon-reload' \
         'systemctl enable 9router' \
-        'systemctl daemon-reload'
+        'systemctl start 9router'
     fi
     cleanup
     TMP=""
@@ -594,6 +720,389 @@ test_health_failure_after_switch_keeps_new_entrypoints() {
   assert_file "$TMP/opt/9router/.runtime/custom-server.js"
   grep -Fq '旧版本保留在' "$TMP/output-health" ||
     fail 'post-switch health failure did not retain updater recovery details'
+  cleanup
+  TMP=""
+}
+
+test_backup_copy_failures_never_restore_partial_material() {
+  local scenario
+
+  for scenario in updater unit; do
+    new_install_tmp
+    make_fakes
+    prepare_existing_unit
+    prepare_existing_updater
+    if run_installer "$TMP/output-cp-$scenario" env "NINEROUTER_TEST_CP_FAIL=$scenario"; then
+      fail "installer succeeded despite $scenario backup copy failure"
+    fi
+    assert_old_unit_restored
+    assert_old_updater_restored
+    assert_no_fixed_recovery_materials
+    ! grep -Fq 'partial-' "$TMP/etc/systemd/system/9router.service" || \
+      fail 'partial unit backup replaced the live unit'
+    ! grep -Fq 'partial-' "$TMP/usr/local/sbin/9router-update" || \
+      fail 'partial updater backup replaced the live updater'
+    cleanup
+    TMP=""
+  done
+}
+
+test_installer_rejects_unknown_enable_state_and_query_error_before_writes() {
+  local scenario
+
+  for scenario in unknown query_error query_error_with_state; do
+    new_install_tmp
+    make_fakes
+    prepare_existing_unit
+    prepare_existing_updater
+    if [[ "$scenario" == unknown ]]; then
+      printf 'static\n' >"$TMP/systemctl.enabled"
+      if run_installer "$TMP/output-$scenario"; then
+        fail 'installer accepted an unrecognized is-enabled state'
+      fi
+    elif [[ "$scenario" == query_error ]]; then
+      if run_installer "$TMP/output-$scenario" env NINEROUTER_TEST_IS_ENABLED_QUERY_ERROR=1; then
+        fail 'installer continued after is-enabled query failure'
+      fi
+    else
+      if run_installer "$TMP/output-$scenario" env NINEROUTER_TEST_IS_ENABLED_QUERY_ERROR_WITH_STATE=1; then
+        fail 'installer trusted is-enabled output from a failed query'
+      fi
+    fi
+    cmp "$TMP/original-unit" "$TMP/etc/systemd/system/9router.service" || \
+      fail "installer wrote the unit after $scenario is-enabled result"
+    assert_old_updater_restored
+    ! grep -Fq 'install updater' "$TMP/install-events.log" || \
+      fail "installer wrote the updater after $scenario is-enabled result"
+    assert_not_exists "$TMP/run/9router-update.phase"
+    assert_no_fixed_recovery_materials
+    cleanup
+    TMP=""
+  done
+}
+
+test_updater_writes_atomic_phase_protocol() {
+  new_tmp
+  make_fakes
+  mkdir -p "$TMP/opt/9router"
+  : >"$TMP/opt/9router/current-marker"
+  if ! run_updater "$TMP/output-phase-success"; then
+    fail 'updater failed while recording the success phase protocol'
+  fi
+  [[ "$(<"$TMP/phase.log")" == "$(printf '%s\n' \
+    preparing building stopping old_moved new_moved started healthy)" ]] || \
+    fail 'updater did not atomically record every success phase in order'
+  grep -Fqx 'healthy' "$TMP/run/9router-update.phase" || \
+    fail 'updater did not retain the final healthy phase'
+  [[ "$(file_mode "$TMP/run/9router-update.phase")" == 600 ]] || \
+    fail 'updater phase file is not private'
+  cleanup
+  TMP=""
+
+  new_tmp
+  make_fakes
+  mkdir -p "$TMP/opt/9router"
+  : >"$TMP/opt/9router/current-marker"
+  if run_updater "$TMP/output-phase-failure" env NINEROUTER_TEST_CURL_MODE=fail; then
+    fail 'updater succeeded despite the phase-protocol health failure'
+  fi
+  [[ "$(<"$TMP/phase.log")" == "$(printf '%s\n' \
+    preparing building stopping old_moved new_moved started health_failed)" ]] || \
+    fail 'updater did not atomically record health_failed after the switch'
+  grep -Fqx 'health_failed' "$TMP/run/9router-update.phase" || \
+    fail 'updater did not retain the final health_failed phase'
+  cleanup
+  TMP=""
+}
+
+test_healthy_phase_is_durable_before_previous_cleanup() {
+  new_tmp
+  make_fakes
+  mkdir -p "$TMP/opt/9router"
+  : >"$TMP/opt/9router/current-marker"
+  if run_updater "$TMP/output-healthy-phase-failure" env NINEROUTER_TEST_FAIL_PHASE=healthy; then
+    fail 'updater succeeded despite failure to persist the healthy phase'
+  fi
+  assert_file "$TMP/opt/9router.previous/current-marker"
+  assert_file "$TMP/opt/9router/.runtime/custom-server.js"
+  grep -Fqx 'started' "$TMP/run/9router-update.phase" || \
+    fail 'failed healthy write did not leave the prior durable phase'
+  cleanup
+  TMP=""
+}
+
+test_preexisting_previous_is_classified_as_pre_switch() {
+  new_install_tmp
+  make_fakes
+  prepare_existing_unit
+  prepare_existing_updater
+  mkdir -p "$TMP/opt/9router" "$TMP/opt/9router.previous"
+  : >"$TMP/opt/9router/current-marker"
+  : >"$TMP/opt/9router.previous/preexisting-marker"
+  if run_installer "$TMP/output-preexisting-previous"; then
+    fail 'installer succeeded despite a preexisting previous directory'
+  fi
+  assert_old_unit_restored
+  assert_old_updater_restored
+  assert_file "$TMP/opt/9router/current-marker"
+  assert_file "$TMP/opt/9router.previous/preexisting-marker"
+  grep -Fqx 'preparing' "$TMP/run/9router-update.phase" || \
+    fail 'preexisting previous was not recorded as a pre-switch failure'
+  ! grep -Fq '人工恢复：' "$TMP/output-preexisting-previous" || \
+    fail 'preexisting previous was incorrectly advertised as rollback material'
+  assert_no_fixed_recovery_materials
+  cleanup
+  TMP=""
+}
+
+test_switch_barrier_preserves_new_entrypoints_and_fixed_recovery_materials() {
+  new_install_tmp
+  make_fakes
+  prepare_legacy_installation
+  if run_installer "$TMP/output-switch-race" env NINEROUTER_TEST_FAIL_OLD_MOVE_AFTER_MUTATION=1; then
+    fail 'installer succeeded despite failure at the old-directory switch barrier'
+  fi
+  cmp "$SERVICE_UNIT" "$TMP/etc/systemd/system/9router.service" || \
+    fail 'switch-race failure rolled back the new unit'
+  cmp "$UPDATER" "$TMP/usr/local/sbin/9router-update" || \
+    fail 'switch-race failure rolled back the new updater'
+  grep -Fqx 'old_moved' "$TMP/run/9router-update.phase" || \
+    fail 'switch barrier was not durably recorded before the old-directory move'
+  cmp "$TMP/original-unit" "$TMP/run/9router-install-recovery.unit" || \
+    fail 'switch-race failure did not retain the old unit recovery material'
+  cmp "$TMP/original-updater" "$TMP/run/9router-install-recovery.updater" || \
+    fail 'switch-race failure did not retain the old updater recovery material'
+  grep -Fq '联合恢复命令：' "$TMP/output-switch-race" || \
+    fail 'switch-race failure did not report combined recovery steps'
+  cleanup
+  TMP=""
+}
+
+test_post_switch_failure_supports_legacy_joint_recovery() {
+  local legacy_exec
+  local legacy_output
+
+  new_install_tmp
+  make_fakes
+  prepare_legacy_installation
+  if run_installer "$TMP/output-joint-recovery" env NINEROUTER_TEST_CURL_MODE=fail; then
+    fail 'installer succeeded despite post-switch health failure'
+  fi
+  cmp "$SERVICE_UNIT" "$TMP/etc/systemd/system/9router.service" || \
+    fail 'post-switch failure did not preserve the new unit现场'
+  cmp "$UPDATER" "$TMP/usr/local/sbin/9router-update" || \
+    fail 'post-switch failure did not preserve the new updater现场'
+  cmp "$TMP/original-unit" "$TMP/run/9router-install-recovery.unit" || \
+    fail 'old unit recovery material has incorrect bytes'
+  cmp "$TMP/original-updater" "$TMP/run/9router-install-recovery.updater" || \
+    fail 'old updater recovery material has incorrect bytes'
+  [[ "$(file_mode "$TMP/run/9router-install-recovery.unit")" == 600 ]] || \
+    fail 'old unit recovery material lost its permissions'
+  [[ "$(file_mode "$TMP/run/9router-install-recovery.updater")" == 700 ]] || \
+    fail 'old updater recovery material lost its permissions'
+  grep -Fqx 'enabled' "$TMP/run/9router-install-recovery.enable-state" || \
+    fail 'original enable state was not retained'
+  [[ "$(file_mode "$TMP/run/9router-install-recovery.enable-state")" == 600 ]] || \
+    fail 'enable-state recovery material is not private'
+  for recovery_path in \
+    "$TMP/run/9router-install-recovery.unit" \
+    "$TMP/run/9router-install-recovery.updater" \
+    "$TMP/run/9router-install-recovery.enable-state" \
+    "$TMP/opt/9router.previous"; do
+    grep -Fq "$recovery_path" "$TMP/output-joint-recovery" || \
+      fail "joint recovery output omitted $recovery_path"
+  done
+  grep -Fq 'systemctl daemon-reload' "$TMP/output-joint-recovery" || \
+    fail 'joint recovery output omitted daemon-reload'
+  grep -Fq 'systemctl start 9router' "$TMP/output-joint-recovery" || \
+    fail 'joint recovery output omitted the old service start'
+  grep -Fq "rm -f -- $TMP/run/9router-install-recovery.enable-state" \
+    "$TMP/output-joint-recovery" || \
+    fail 'joint recovery output did not consume the enable-state material'
+
+  run_fake_systemctl stop 9router
+  /bin/rm -rf -- "$TMP/opt/9router"
+  /bin/mv -f "$TMP/run/9router-install-recovery.unit" \
+    "$TMP/etc/systemd/system/9router.service"
+  /bin/mv -f "$TMP/run/9router-install-recovery.updater" \
+    "$TMP/usr/local/sbin/9router-update"
+  /bin/mv "$TMP/opt/9router.previous" "$TMP/opt/9router"
+  run_fake_systemctl daemon-reload
+  run_fake_systemctl enable 9router
+  run_fake_systemctl start 9router
+  /bin/rm -f -- "$TMP/run/9router-install-recovery.enable-state"
+  cmp "$TMP/original-unit" "$TMP/etc/systemd/system/9router.service" || \
+    fail 'joint recovery did not restore the legacy unit'
+  assert_old_updater_restored
+  legacy_exec="$(sed -n 's/^ExecStart=//p' "$TMP/etc/systemd/system/9router.service")"
+  legacy_output="$("$legacy_exec")"
+  [[ "$legacy_output" == legacy-entrypoint-ok ]] || \
+    fail 'restored legacy unit entrypoint is not executable'
+  assert_no_fixed_recovery_materials
+  cleanup
+  TMP=""
+}
+
+test_first_install_post_switch_failure_has_no_joint_recovery_command() {
+  new_install_tmp
+  make_fakes
+  printf 'not-found\n' >"$TMP/systemctl.enabled"
+  rm -f -- "$TMP/systemctl.wants-link"
+  if run_installer "$TMP/output-first-post-switch" env NINEROUTER_TEST_CURL_MODE=fail; then
+    fail 'first install succeeded despite post-switch health failure'
+  fi
+  cmp "$SERVICE_UNIT" "$TMP/etc/systemd/system/9router.service" || \
+    fail 'first-install failure did not preserve the new unit现场'
+  cmp "$UPDATER" "$TMP/usr/local/sbin/9router-update" || \
+    fail 'first-install failure did not preserve the new updater现场'
+  assert_not_exists "$TMP/run/9router-install-recovery.unit"
+  assert_not_exists "$TMP/run/9router-install-recovery.updater"
+  grep -Fqx 'not-found' "$TMP/run/9router-install-recovery.enable-state" || \
+    fail 'first-install failure did not retain the original not-found state'
+  grep -Fq '没有旧 unit 与旧 updater 可供联合恢复' "$TMP/output-first-post-switch" || \
+    fail 'first-install failure did not explain why joint recovery is unavailable'
+  ! grep -Fq '联合恢复命令：' "$TMP/output-first-post-switch" || \
+    fail 'first-install failure advertised an invalid joint recovery command'
+  cleanup
+  TMP=""
+}
+
+test_phase_and_recovery_paths_are_guarded() {
+  new_tmp
+  make_fakes
+  if run_updater "$TMP/output-phase-outside" env NINEROUTER_PHASE_FILE=/run/9router-update.phase; then
+    fail 'root test updater accepted a phase file outside the test root'
+  fi
+  assert_empty_file "$TMP/git.log"
+  cleanup
+  TMP=""
+
+  new_tmp
+  make_fakes
+  : >"$TMP/phase-target"
+  ln -s "$TMP/phase-target" "$TMP/run/9router-update.phase"
+  if run_updater "$TMP/output-phase-symlink"; then
+    fail 'updater accepted a symlink phase file'
+  fi
+  assert_empty_file "$TMP/git.log"
+  cleanup
+  TMP=""
+
+  new_install_tmp
+  make_fakes
+  if run_installer "$TMP/output-recovery-outside" env \
+    NINEROUTER_RECOVERY_UNIT=/run/9router-install-recovery.unit; then
+    fail 'root test installer accepted recovery material outside the test root'
+  fi
+  ! grep -Fq 'install updater' "$TMP/install-events.log" || \
+    fail 'installer wrote an entrypoint before rejecting an unsafe recovery path'
+  cleanup
+  TMP=""
+}
+
+test_masked_unit_symlink_is_restored_before_switch() {
+  new_install_tmp
+  make_fakes
+  prepare_masked_installation
+  if run_installer "$TMP/output-masked" env \
+    NINEROUTER_TEST_BUILD_FAIL=1 NINEROUTER_TEST_REALISTIC_MASK=1; then
+    fail 'masked installation succeeded despite pre-switch build failure'
+  fi
+  [[ -L "$TMP/etc/systemd/system/9router.service" ]] ||
+    fail 'pre-switch failure did not restore the masked unit symlink'
+  [[ "$(readlink "$TMP/etc/systemd/system/9router.service")" == /dev/null ]] ||
+    fail 'restored masked unit does not target /dev/null'
+  assert_old_updater_restored
+  grep -Fqx 'masked' "$TMP/systemctl.enabled" ||
+    fail 'pre-switch failure did not restore the masked enable state'
+  assert_no_fixed_recovery_materials
+  cleanup
+  TMP=""
+}
+
+test_non_mask_unit_symlink_is_rejected_before_entrypoint_writes() {
+  new_install_tmp
+  make_fakes
+  prepare_existing_updater
+  mkdir -p "$TMP/opt/9router"
+  printf '[Service]\nExecStart=/legacy/linked-router\n' >"$TMP/linked-unit-target"
+  rm -f -- "$TMP/etc/systemd/system/9router.service"
+  ln -s "$TMP/linked-unit-target" "$TMP/etc/systemd/system/9router.service"
+  if run_installer "$TMP/output-linked-unit"; then
+    fail 'installer accepted a non-mask unit symlink'
+  fi
+  [[ -L "$TMP/etc/systemd/system/9router.service" ]] ||
+    fail 'installer replaced the rejected unit symlink'
+  [[ "$(readlink "$TMP/etc/systemd/system/9router.service")" == "$TMP/linked-unit-target" ]] ||
+    fail 'installer changed the rejected unit symlink target'
+  assert_old_updater_restored
+  ! grep -Fq 'install updater' "$TMP/install-events.log" ||
+    fail 'installer wrote an updater before rejecting the unit symlink'
+  assert_no_fixed_recovery_materials
+  cleanup
+  TMP=""
+}
+
+test_updater_symlink_is_rejected_before_entrypoint_writes() {
+  new_install_tmp
+  make_fakes
+  prepare_existing_unit
+  printf '#!/usr/bin/env bash\nprintf linked-updater\\n\n' >"$TMP/linked-updater-target"
+  chmod 0700 "$TMP/linked-updater-target"
+  rm -f -- "$TMP/usr/local/sbin/9router-update"
+  ln -s "$TMP/linked-updater-target" "$TMP/usr/local/sbin/9router-update"
+  if run_installer "$TMP/output-linked-updater"; then
+    fail 'installer accepted an updater symlink'
+  fi
+  [[ -L "$TMP/usr/local/sbin/9router-update" ]] ||
+    fail 'installer replaced the rejected updater symlink'
+  [[ "$(readlink "$TMP/usr/local/sbin/9router-update")" == "$TMP/linked-updater-target" ]] ||
+    fail 'installer changed the rejected updater symlink target'
+  cmp "$TMP/original-unit" "$TMP/etc/systemd/system/9router.service" ||
+    fail 'installer changed the unit before rejecting the updater symlink'
+  ! grep -Fq 'install updater' "$TMP/install-events.log" ||
+    fail 'installer wrote an updater before rejecting the updater symlink'
+  assert_no_fixed_recovery_materials
+  cleanup
+  TMP=""
+}
+
+test_installer_lock_contention_prevents_phase_and_entrypoint_mutation() {
+  new_install_tmp
+  make_fakes
+  prepare_existing_unit
+  prepare_existing_updater
+  printf 'old_moved\n' >"$TMP/run/9router-update.phase"
+  if run_installer "$TMP/output-installer-lock" env NINEROUTER_TEST_LOCK_FAIL=1; then
+    fail 'installer ran despite deployment-lock contention'
+  fi
+  cmp "$TMP/original-unit" "$TMP/etc/systemd/system/9router.service" ||
+    fail 'lock-contended installer changed the unit'
+  assert_old_updater_restored
+  grep -Fqx 'old_moved' "$TMP/run/9router-update.phase" ||
+    fail 'lock-contended installer cleared another updater phase'
+  ! grep -Fq 'install updater' "$TMP/install-events.log" ||
+    fail 'lock-contended installer wrote a new updater'
+  assert_no_fixed_recovery_materials
+  cleanup
+  TMP=""
+}
+
+test_pre_switch_stop_race_restarts_the_restored_legacy_service() {
+  new_install_tmp
+  make_fakes
+  prepare_legacy_installation
+  if run_installer "$TMP/output-stop-race" env NINEROUTER_TEST_CREATE_PREVIOUS_ON_STOP=1; then
+    fail 'installer succeeded despite previous appearing after stop'
+  fi
+  cmp "$TMP/original-unit" "$TMP/etc/systemd/system/9router.service" ||
+    fail 'stop-race failure did not restore the legacy unit'
+  assert_old_updater_restored
+  grep -Fqx 'active' "$TMP/systemctl.state" ||
+    fail 'stop-race failure left the previously active legacy service stopped'
+  assert_file "$TMP/opt/9router/legacy-entrypoint"
+  assert_file "$TMP/opt/9router.previous/race-marker"
+  assert_no_fixed_recovery_materials
   cleanup
   TMP=""
 }
@@ -911,9 +1420,9 @@ test_health_rejects_inactive_service_and_trap_preserves_recovery_state() {
   fi
   assert_file "$TMP/opt/9router.previous/current-marker"
   assert_dir "$TMP/opt/9router"
-  grep -Fq '阶段：starting-new-in-progress' "$TMP/output-term" || \
+  grep -Fq '阶段：new_moved' "$TMP/output-term" || \
     fail 'trap did not retain the pre-start in-progress phase'
-  grep -Fq '新版本已位于正式目录' "$TMP/output-term" || \
+  grep -Fq '构建目录已成为正式目录' "$TMP/output-term" || \
     fail 'trap did not report the actual post-switch state'
   grep -Fq '人工恢复：' "$TMP/output-term" || \
     fail 'trap did not retain a manual recovery instruction'
@@ -931,6 +1440,20 @@ test_installer_uses_only_test_paths_and_preserves_existing_data
 test_installer_rolls_back_unit_on_failure
 test_first_install_failure_removes_new_unit
 test_health_failure_after_switch_keeps_new_entrypoints
+test_backup_copy_failures_never_restore_partial_material
+test_installer_rejects_unknown_enable_state_and_query_error_before_writes
+test_updater_writes_atomic_phase_protocol
+test_healthy_phase_is_durable_before_previous_cleanup
+test_preexisting_previous_is_classified_as_pre_switch
+test_switch_barrier_preserves_new_entrypoints_and_fixed_recovery_materials
+test_post_switch_failure_supports_legacy_joint_recovery
+test_first_install_post_switch_failure_has_no_joint_recovery_command
+test_phase_and_recovery_paths_are_guarded
+test_masked_unit_symlink_is_restored_before_switch
+test_non_mask_unit_symlink_is_rejected_before_entrypoint_writes
+test_updater_symlink_is_rejected_before_entrypoint_writes
+test_installer_lock_contention_prevents_phase_and_entrypoint_mutation
+test_pre_switch_stop_race_restarts_the_restored_legacy_service
 test_installer_rejects_unsafe_test_roots
 test_successful_update_installs_flat_runtime_and_restarts_service
 test_rejects_unsafe_data_overlapping_and_symlink_paths

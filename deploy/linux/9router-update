@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
 ROOT_TEST_MODE=0
 TEST_ROOT=""
+INHERITED_LOCK_FD="${NINEROUTER_INHERITED_LOCK_FD:-}"
 if [[ "$EUID" -eq 0 && "${NINEROUTER_TEST_MODE:-0}" == 1 ]]; then
   ROOT_TEST_MODE=1
   TEST_ROOT="${NINEROUTER_TEST_ROOT:-}"
-  for override in ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE GIT NPM NODE SYSTEMCTL CURL MV STAT FLOCK MKDIR RM CP SLEEP; do
+  for override in ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE PHASE_FILE GIT NPM NODE SYSTEMCTL CURL MV STAT FLOCK MKDIR RM CP SLEEP; do
     env_name="NINEROUTER_${override}"
     [[ -n "${!env_name+x}" ]] ||
       { printf 'root 测试模式缺少 %s\n' "$env_name" >&2; exit 1; }
@@ -15,6 +17,7 @@ if [[ "$EUID" -eq 0 && "${NINEROUTER_TEST_MODE:-0}" == 1 ]]; then
   BUILD_DIR="$NINEROUTER_BUILD_DIR"
   PREVIOUS_DIR="$NINEROUTER_PREVIOUS_DIR"
   LOCK_FILE="$NINEROUTER_LOCK_FILE"
+  PHASE_FILE="$NINEROUTER_PHASE_FILE"
   GIT="$NINEROUTER_GIT"
   NPM="$NINEROUTER_NPM"
   NODE="$NINEROUTER_NODE"
@@ -28,7 +31,7 @@ if [[ "$EUID" -eq 0 && "${NINEROUTER_TEST_MODE:-0}" == 1 ]]; then
   CP="$NINEROUTER_CP"
   SLEEP="$NINEROUTER_SLEEP"
 elif [[ "$EUID" -eq 0 ]]; then
-  for override in ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE GIT NPM NODE SYSTEMCTL CURL MV STAT FLOCK MKDIR RM CP SLEEP; do
+  for override in ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE PHASE_FILE GIT NPM NODE SYSTEMCTL CURL MV STAT FLOCK MKDIR RM CP SLEEP; do
     env_name="NINEROUTER_${override}"
     [[ -z "${!env_name+x}" ]] || {
       printf 'root 环境拒绝 %s 覆盖\n' "$env_name" >&2
@@ -39,6 +42,7 @@ elif [[ "$EUID" -eq 0 ]]; then
   BUILD_DIR=/opt/9router-build
   PREVIOUS_DIR=/opt/9router.previous
   LOCK_FILE=/run/9router-update.lock
+  PHASE_FILE=/run/9router-update.phase
   GIT=/usr/bin/git
   NPM=/opt/node-v24.15.0-npm/node/bin/npm
   NODE=/opt/node-v24.15.0-npm/node/bin/node
@@ -56,6 +60,7 @@ else
   BUILD_DIR="${NINEROUTER_BUILD_DIR:-/opt/9router-build}"
   PREVIOUS_DIR="${NINEROUTER_PREVIOUS_DIR:-/opt/9router.previous}"
   LOCK_FILE="${NINEROUTER_LOCK_FILE:-/run/9router-update.lock}"
+  PHASE_FILE="${NINEROUTER_PHASE_FILE:-/run/9router-update.phase}"
   GIT="${NINEROUTER_GIT:-/usr/bin/git}"
   NPM="${NINEROUTER_NPM:-/opt/node-v24.15.0-npm/node/bin/npm}"
   NODE="${NINEROUTER_NODE:-/opt/node-v24.15.0-npm/node/bin/node}"
@@ -129,7 +134,7 @@ validate_root_test_mode() {
     *) die "root 测试根必须位于受限临时目录：$test_root_real" ;;
   esac
 
-  for variable_name in ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE GIT NPM NODE SYSTEMCTL CURL MV STAT FLOCK MKDIR RM CP SLEEP; do
+  for variable_name in ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE PHASE_FILE GIT NPM NODE SYSTEMCTL CURL MV STAT FLOCK MKDIR RM CP SLEEP; do
     candidate="${!variable_name}"
     resolved="$("$REALPATH" -m -- "$candidate")" ||
       die "root 测试路径无法 realpath：$variable_name"
@@ -142,12 +147,17 @@ ROOT="$(normalize_path ROOT "$ROOT")"
 BUILD_DIR="$(normalize_path BUILD_DIR "$BUILD_DIR")"
 PREVIOUS_DIR="$(normalize_path PREVIOUS_DIR "$PREVIOUS_DIR")"
 LOCK_FILE="$(normalize_path LOCK_FILE "$LOCK_FILE")"
+PHASE_FILE="$(normalize_path PHASE_FILE "$PHASE_FILE")"
 if paths_overlap "$ROOT" "$BUILD_DIR" ||
   paths_overlap "$ROOT" "$PREVIOUS_DIR" ||
   paths_overlap "$ROOT" "$LOCK_FILE" ||
   paths_overlap "$BUILD_DIR" "$PREVIOUS_DIR" ||
   paths_overlap "$BUILD_DIR" "$LOCK_FILE" ||
-  paths_overlap "$PREVIOUS_DIR" "$LOCK_FILE"; then
+  paths_overlap "$PREVIOUS_DIR" "$LOCK_FILE" ||
+  paths_overlap "$ROOT" "$PHASE_FILE" ||
+  paths_overlap "$BUILD_DIR" "$PHASE_FILE" ||
+  paths_overlap "$PREVIOUS_DIR" "$PHASE_FILE" ||
+  paths_overlap "$LOCK_FILE" "$PHASE_FILE"; then
   die "部署目录不得相同或互为祖先子孙目录"
 fi
 if [[ "$ROOT_TEST_MODE" -eq 1 ]]; then
@@ -164,16 +174,52 @@ fi
 if [[ -L "$LOCK_FILE" || ( -e "$LOCK_FILE" && ! -f "$LOCK_FILE" ) ]]; then
   die "锁文件必须为不存在或普通文件：$LOCK_FILE"
 fi
-exec 9>>"$LOCK_FILE"
-"$FLOCK" -n 9 || { echo "已有 9Router 更新正在执行" >&2; exit 1; }
-
-if [[ -e "$PREVIOUS_DIR" || -L "$PREVIOUS_DIR" ]]; then
-  die "检测到已有旧版本目录，拒绝更新以保留人工恢复状态：$PREVIOUS_DIR"
+if [[ -n "$INHERITED_LOCK_FD" ]]; then
+  [[ "$INHERITED_LOCK_FD" =~ ^[0-9]+$ ]] || die '继承锁 FD 必须是数字'
+  if [[ -e "/proc/self/fd/$INHERITED_LOCK_FD" ]]; then
+    inherited_fd_path="/proc/self/fd/$INHERITED_LOCK_FD"
+  else
+    inherited_fd_path="/dev/fd/$INHERITED_LOCK_FD"
+  fi
+  [[ -e "$inherited_fd_path" ]] || die '继承锁 FD 未打开'
+  lock_identity="$("$STAT" -Lc '%d:%i' -- "$LOCK_FILE")" || die '无法读取锁文件标识'
+  inherited_identity="$("$STAT" -Lc '%d:%i' -- "$inherited_fd_path")" ||
+    die '无法读取继承锁 FD 标识'
+  [[ "$lock_identity" == "$inherited_identity" ]] || die '继承锁 FD 与更新锁文件不一致'
+  "$FLOCK" -n "$INHERITED_LOCK_FD" || { echo "继承的 9Router 更新锁无效" >&2; exit 1; }
+else
+  exec 9>>"$LOCK_FILE"
+  "$FLOCK" -n 9 || { echo "已有 9Router 更新正在执行" >&2; exit 1; }
 fi
 
 phase="preparing"
+phase_temp=""
 swapped=0
 had_existing_root=0
+
+write_phase() {
+  local next_phase="$1"
+  local phase_parent="${PHASE_FILE%/*}"
+
+  case "$next_phase" in
+    preparing|building|stopping|old_moved|new_moved|started|healthy|health_failed) ;;
+    *) die "拒绝写入未知更新阶段：$next_phase" ;;
+  esac
+  if [[ -e "$phase_parent" && ! -d "$phase_parent" ]]; then
+    die "阶段文件父路径不是目录：$phase_parent"
+  fi
+  "$MKDIR" -p "$phase_parent"
+  [[ -d "$phase_parent" && ! -L "$phase_parent" ]] ||
+    die "阶段文件父目录不安全：$phase_parent"
+  if [[ -L "$PHASE_FILE" || ( -e "$PHASE_FILE" && ! -f "$PHASE_FILE" ) ]]; then
+    die "阶段文件必须为不存在或普通文件：$PHASE_FILE"
+  fi
+  phase_temp="$(/usr/bin/mktemp "${PHASE_FILE}.tmp.XXXXXX")"
+  printf '%s\n' "$next_phase" >"$phase_temp"
+  "$MV" -fT -- "$phase_temp" "$PHASE_FILE"
+  phase_temp=""
+  phase="$next_phase"
+}
 
 service_is_explicitly_stopped() {
   local state
@@ -220,42 +266,54 @@ report_failure() {
     preparing)
       printf '目录切换尚未开始，正式目录未被本脚本移动。\n' >&2
       ;;
-    stopped)
-      printf '服务已停止，目录切换尚未开始。\n' >&2
+    building)
+      printf '正在构建新版本，目录切换尚未开始。\n' >&2
       ;;
-    stopping-in-progress)
+    stopping)
       printf '正在停止服务，尚未开始目录切换。\n' >&2
       ;;
-    moving-old-in-progress)
-      printf '正在将旧版本移至 previous，请依据下方目录状态恢复。\n' >&2
-      ;;
-    old-preserved)
+    old_moved)
       printf '旧版本已移至 previous，新版本尚未完全启动。\n' >&2
       ;;
-    moving-new-in-progress)
+    new_moved)
       printf '正在将构建目录切换为正式目录，请依据下方目录状态恢复。\n' >&2
       ;;
-    new-deployed|starting-new-in-progress|new-started)
+    started|health_failed)
       printf '新版本已位于正式目录，服务启动或健康检查未完成。\n' >&2
+      ;;
+    healthy)
+      printf '新版本已通过健康检查，但后续收尾失败。\n' >&2
       ;;
   esac
   if [[ "$swapped" -eq 1 ]]; then
     printf '构建目录已成为正式目录，trap 不会删除它。\n' >&2
   fi
 
-  if [[ -e "$PREVIOUS_DIR" ]]; then
-    if [[ -e "$ROOT" ]]; then
-      printf '旧版本保留在 %q。\n' "$PREVIOUS_DIR" >&2
-      printf '人工恢复：systemctl stop 9router && rm -rf -- %q && mv -- %q %q && systemctl start 9router\n' \
-        "$ROOT" "$PREVIOUS_DIR" "$ROOT" >&2
-    else
-      printf '旧版本保留在 %q，正式目录当前不存在。\n' "$PREVIOUS_DIR" >&2
-      printf '人工恢复：mv -- %q %q && systemctl start 9router\n' \
-        "$PREVIOUS_DIR" "$ROOT" >&2
-    fi
-  else
-    printf '未发现可恢复的旧版本目录，未生成恢复命令。\n' >&2
-  fi
+  case "$phase" in
+    old_moved|new_moved|started|healthy|health_failed)
+      if [[ -e "$PREVIOUS_DIR" ]]; then
+        if [[ -e "$ROOT" ]]; then
+          printf '旧版本保留在 %q。\n' "$PREVIOUS_DIR" >&2
+          printf '人工恢复：systemctl stop 9router && rm -rf -- %q && mv -- %q %q && systemctl start 9router\n' \
+            "$ROOT" "$PREVIOUS_DIR" "$ROOT" >&2
+        else
+          printf '旧版本保留在 %q，正式目录当前不存在。\n' "$PREVIOUS_DIR" >&2
+          printf '人工恢复：mv -- %q %q && systemctl start 9router\n' \
+            "$PREVIOUS_DIR" "$ROOT" >&2
+        fi
+      else
+        printf '未发现可恢复的旧版本目录，未生成恢复命令。\n' >&2
+      fi
+      ;;
+    *)
+      if [[ -e "$PREVIOUS_DIR" || -L "$PREVIOUS_DIR" ]]; then
+        printf '检测到的 previous 未由本次更新切换产生，已原样保留且不生成恢复命令：%q\n' \
+          "$PREVIOUS_DIR" >&2
+      else
+        printf '目录切换尚未发生，未生成恢复命令。\n' >&2
+      fi
+      ;;
+  esac
 
   if [[ -e "$ROOT" ]]; then
     printf '当前正式目录：%q\n' "$ROOT" >&2
@@ -268,6 +326,9 @@ report_failure() {
 on_exit() {
   local exit_code="$?"
   trap - EXIT INT TERM
+  if [[ -n "$phase_temp" && ( -e "$phase_temp" || -L "$phase_temp" ) ]]; then
+    "$RM" -f -- "$phase_temp" || true
+  fi
   if [[ "$exit_code" -ne 0 ]]; then
     report_failure "$exit_code"
   fi
@@ -277,6 +338,12 @@ trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+write_phase preparing
+if [[ -e "$PREVIOUS_DIR" || -L "$PREVIOUS_DIR" ]]; then
+  die "检测到已有旧版本目录，拒绝更新以保留人工恢复状态：$PREVIOUS_DIR"
+fi
+
+write_phase building
 "$RM" -rf -- "$BUILD_DIR"
 "$GIT" clone --depth 1 --branch "$BRANCH" "$REPOSITORY" "$BUILD_DIR"
 (
@@ -304,35 +371,31 @@ ensure_deployment_same_device
 
 if [[ -e "$ROOT" ]]; then
   had_existing_root=1
-  phase="stopping-in-progress"
+  write_phase stopping
   if ! "$SYSTEMCTL" stop 9router; then
     die "停止 9Router 服务失败，拒绝切换目录"
   fi
-  phase="stopped"
   if ! service_is_explicitly_stopped; then
     die "9Router 服务未明确处于 inactive 或 failed 状态，拒绝切换目录"
   fi
   if [[ -e "$PREVIOUS_DIR" || -L "$PREVIOUS_DIR" ]]; then
     die "切换前检测到 previous 目录，拒绝覆盖或嵌套旧版本"
   fi
-  phase="moving-old-in-progress"
+  write_phase old_moved
   "$MV" -T -n -- "$ROOT" "$PREVIOUS_DIR"
   if [[ -e "$ROOT" || -L "$ROOT" || ! -e "$PREVIOUS_DIR" ]]; then
     die "旧版本目录移动未完成，拒绝继续切换"
   fi
-  phase="old-preserved"
 fi
 
-phase="moving-new-in-progress"
+write_phase new_moved
 "$MV" -T -n -- "$BUILD_DIR" "$ROOT"
 if [[ -e "$BUILD_DIR" || -L "$BUILD_DIR" || ! -e "$ROOT" ]]; then
   die "新版本目录移动未完成，拒绝继续启动"
 fi
 swapped=1
-phase="new-deployed"
-phase="starting-new-in-progress"
 "$SYSTEMCTL" start 9router
-phase="new-started"
+write_phase started
 
 healthy=0
 for _ in {1..30}; do
@@ -360,10 +423,12 @@ for _ in {1..30}; do
 done
 
 if [[ "$healthy" -ne 1 ]]; then
+  write_phase health_failed
   exit 1
 fi
 
 revision="$("$GIT" -C "$ROOT" rev-parse --short HEAD)"
+write_phase healthy
 if [[ "$had_existing_root" -eq 1 ]]; then
   "$RM" -rf -- "$PREVIOUS_DIR"
 fi
