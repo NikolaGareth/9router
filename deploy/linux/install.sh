@@ -9,6 +9,13 @@ UNIT_DEPLOYED=0
 UNIT_TRANSACTION_ACTIVE=0
 UNIT_BACKUP=""
 UNIT_STAGED=""
+UPDATER_EXISTED=0
+UPDATER_DEPLOYED=0
+UPDATER_BACKUP=""
+UPDATER_STAGED=""
+ENABLE_STATE=not-found
+HAD_ROOT=0
+UPDATER_STARTED=0
 
 die() {
   printf '%s\n' "$*" >&2
@@ -73,6 +80,9 @@ restore_unit_after_failure() {
       restore_failed=1
     fi
   fi
+  if [[ -n "$UPDATER_STAGED" && -e "$UPDATER_STAGED" ]]; then
+    "$RM" -f -- "$UPDATER_STAGED" || restore_failed=1
+  fi
   if (( UNIT_EXISTED == 1 )); then
     if [[ -n "$UNIT_BACKUP" && ( -e "$UNIT_BACKUP" || -L "$UNIT_BACKUP" ) ]]; then
       if ! "$MV" -fT -- "$UNIT_BACKUP" "$SERVICE_TARGET"; then
@@ -84,11 +94,27 @@ restore_unit_after_failure() {
       restore_failed=1
     fi
   elif (( UNIT_DEPLOYED == 1 )); then
+    "$SYSTEMCTL" disable 9router || restore_failed=1
     if ! "$RM" -f -- "$SERVICE_TARGET"; then
       printf '无法移除首次安装的 systemd unit：%s\n' "$SERVICE_TARGET" >&2
       restore_failed=1
     fi
   fi
+  if (( UPDATER_EXISTED == 1 )); then
+    if [[ -n "$UPDATER_BACKUP" && -e "$UPDATER_BACKUP" ]]; then
+      "$MV" -fT -- "$UPDATER_BACKUP" "$UPDATER_TARGET" || restore_failed=1
+    else
+      restore_failed=1
+    fi
+  elif (( UPDATER_DEPLOYED == 1 )); then
+    "$RM" -f -- "$UPDATER_TARGET" || restore_failed=1
+  fi
+  case "$ENABLE_STATE" in
+    enabled) "$SYSTEMCTL" enable 9router || restore_failed=1 ;;
+    disabled) "$SYSTEMCTL" disable 9router || restore_failed=1 ;;
+    masked) "$SYSTEMCTL" mask 9router || restore_failed=1 ;;
+    not-found) "$SYSTEMCTL" disable 9router || restore_failed=1 ;;
+  esac
   if (( UNIT_DEPLOYED == 1 || UNIT_EXISTED == 1 )); then
     if ! "$SYSTEMCTL" daemon-reload; then
       printf 'unit 回滚后 systemd daemon-reload 失败\n' >&2
@@ -104,7 +130,12 @@ on_exit() {
 
   trap - EXIT
   if [[ "$exit_code" -ne 0 ]]; then
-    restore_unit_after_failure || true
+    if (( UPDATER_STARTED == 1 )) && { [[ -e "$PREVIOUS_DIR" ]] || { (( HAD_ROOT == 0 )) && [[ -e "$DEPLOY_ROOT" ]]; }; }; then
+      UNIT_TRANSACTION_ACTIVE=0
+      printf '9Router 已完成目录切换；保留新 unit、更新器及 previous/日志现场以便恢复。\n' >&2
+    else
+      restore_unit_after_failure || true
+    fi
   fi
   exit "$exit_code"
 }
@@ -124,6 +155,8 @@ if [[ "$TEST_MODE" == 1 ]]; then
   done
 
   UPDATER_TARGET="$NINEROUTER_UPDATER_TARGET"
+  DEPLOY_ROOT="$NINEROUTER_ROOT"
+  PREVIOUS_DIR="$NINEROUTER_PREVIOUS_DIR"
   SERVICE_TARGET="$NINEROUTER_SERVICE_TARGET"
   DATA_DIR="$NINEROUTER_DATA_DIR"
   SYSTEMCTL="$NINEROUTER_SYSTEMCTL"
@@ -141,12 +174,16 @@ if [[ "$TEST_MODE" == 1 ]]; then
   for target in UPDATER_TARGET SERVICE_TARGET DATA_DIR SYSTEMCTL NODE NPM GIT CURL FLOCK MKDIR CP MV RM INSTALL; do
     validate_test_path "$target" "${!target}"
   done
+  validate_test_path DEPLOY_ROOT "$DEPLOY_ROOT"
+  validate_test_path PREVIOUS_DIR "$PREVIOUS_DIR"
 else
   for override in NINEROUTER_TEST_MODE NINEROUTER_TEST_ROOT NINEROUTER_UPDATER_TARGET NINEROUTER_SERVICE_TARGET NINEROUTER_DATA_DIR NINEROUTER_SYSTEMCTL NINEROUTER_NODE NINEROUTER_NPM NINEROUTER_GIT NINEROUTER_CURL NINEROUTER_FLOCK NINEROUTER_MKDIR NINEROUTER_CP NINEROUTER_MV NINEROUTER_RM NINEROUTER_INSTALL; do
     [[ -z "${!override+x}" ]] || die "root 环境拒绝 $override 覆盖"
   done
 
   UPDATER_TARGET=/usr/local/sbin/9router-update
+  DEPLOY_ROOT=/opt/9router
+  PREVIOUS_DIR=/opt/9router.previous
   SERVICE_TARGET=/etc/systemd/system/9router.service
   DATA_DIR=/root/.9router
   SYSTEMCTL=/usr/bin/systemctl
@@ -178,14 +215,26 @@ require_executable install "$INSTALL"
 [[ -f "$SCRIPT_DIR/9router.service" ]] || die '缺少 deploy/linux/9router.service'
 
 "$MKDIR" -p "${UPDATER_TARGET%/*}" "${SERVICE_TARGET%/*}"
-"$INSTALL" -m 0755 "$SCRIPT_DIR/9router-update" "$UPDATER_TARGET"
+UNIT_TRANSACTION_ACTIVE=1
+trap on_exit EXIT
+if [[ -e "$DEPLOY_ROOT" ]]; then HAD_ROOT=1; fi
+if ENABLE_STATE="$($SYSTEMCTL is-enabled 9router 2>/dev/null)"; then :; fi
+case "$ENABLE_STATE" in enabled|disabled|masked|not-found) ;; *) ENABLE_STATE=not-found ;; esac
+if [[ -e "$UPDATER_TARGET" || -L "$UPDATER_TARGET" ]]; then
+  UPDATER_EXISTED=1
+  UPDATER_BACKUP="$(/usr/bin/mktemp "${UPDATER_TARGET}.backup.XXXXXX")"
+  "$CP" -a -- "$UPDATER_TARGET" "$UPDATER_BACKUP"
+fi
+UPDATER_STAGED="$(/usr/bin/mktemp "${UPDATER_TARGET}.new.XXXXXX")"
+"$INSTALL" -m 0755 "$SCRIPT_DIR/9router-update" "$UPDATER_STAGED"
+"$MV" -fT -- "$UPDATER_STAGED" "$UPDATER_TARGET"
+UPDATER_STAGED=""
+UPDATER_DEPLOYED=1
 if [[ -e "$SERVICE_TARGET" || -L "$SERVICE_TARGET" ]]; then
   UNIT_EXISTED=1
   UNIT_BACKUP="$(/usr/bin/mktemp "${SERVICE_TARGET}.backup.XXXXXX")"
   "$CP" -a -- "$SERVICE_TARGET" "$UNIT_BACKUP"
 fi
-UNIT_TRANSACTION_ACTIVE=1
-trap on_exit EXIT
 UNIT_STAGED="$(/usr/bin/mktemp "${SERVICE_TARGET}.new.XXXXXX")"
 "$INSTALL" -m 0644 "$SCRIPT_DIR/9router.service" "$UNIT_STAGED"
 "$MV" -fT -- "$UNIT_STAGED" "$SERVICE_TARGET"
@@ -194,8 +243,13 @@ UNIT_DEPLOYED=1
 "$MKDIR" -p "$DATA_DIR"
 "$SYSTEMCTL" daemon-reload
 "$SYSTEMCTL" enable 9router
+UPDATER_STARTED=1
 "$UPDATER_TARGET"
-if [[ -n "$UNIT_BACKUP" ]]; then
-  "$RM" -f -- "$UNIT_BACKUP"
-fi
+UPDATER_STARTED=0
 UNIT_TRANSACTION_ACTIVE=0
+if [[ -n "$UNIT_BACKUP" ]]; then
+  "$RM" -f -- "$UNIT_BACKUP" || printf '警告：无法清理 unit 备份：%s\n' "$UNIT_BACKUP" >&2
+fi
+if [[ -n "$UPDATER_BACKUP" ]]; then
+  "$RM" -f -- "$UPDATER_BACKUP" || printf '警告：无法清理更新器备份：%s\n' "$UPDATER_BACKUP" >&2
+fi

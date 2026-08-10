@@ -86,6 +86,8 @@ make_fakes() {
   : >"$TMP/flock.log"
   : >"$TMP/install-events.log"
   printf 'active\n' >"$TMP/systemctl.state"
+  printf '%s\n' "${NINEROUTER_TEST_INITIAL_ENABLED_STATE:-enabled}" >"$TMP/systemctl.enabled"
+  : >"$TMP/systemctl.wants-link"
 
   cat >"$TMP/bin/git" <<'EOF'
 #!/usr/bin/env bash
@@ -188,7 +190,29 @@ case "$1" in
     ;;
   enable)
     [[ "$2" == 9router ]]
+    printf 'enabled\n' >"$NINEROUTER_TEST_SYSTEMCTL_ENABLED_STATE"
+    : >"$NINEROUTER_TEST_SYSTEMCTL_WANTS_LINK"
     [[ "${NINEROUTER_TEST_ENABLE_FAIL:-0}" != 1 ]] || exit 8
+    ;;
+  disable)
+    [[ "$2" == 9router ]]
+    printf 'disabled\n' >"$NINEROUTER_TEST_SYSTEMCTL_ENABLED_STATE"
+    rm -f -- "$NINEROUTER_TEST_SYSTEMCTL_WANTS_LINK"
+    ;;
+  mask)
+    [[ "$2" == 9router ]]
+    printf 'masked\n' >"$NINEROUTER_TEST_SYSTEMCTL_ENABLED_STATE"
+    rm -f -- "$NINEROUTER_TEST_SYSTEMCTL_WANTS_LINK"
+    ;;
+  is-enabled)
+    [[ "$2" == 9router ]]
+    state="$(cat "$NINEROUTER_TEST_SYSTEMCTL_ENABLED_STATE")"
+    printf '%s\n' "$state"
+    case "$state" in
+      enabled) exit 0 ;;
+      disabled|masked|not-found) exit 1 ;;
+      *) exit 3 ;;
+    esac
     ;;
   stop)
     [[ "$2" == 9router ]]
@@ -211,7 +235,9 @@ case "$1" in
       printf 'active\n' >"$NINEROUTER_TEST_SYSTEMCTL_STATE"
     fi
     if [[ "${NINEROUTER_TEST_SEND_TERM_ON_START:-0}" == 1 ]]; then
-      kill -TERM "$PPID"
+      while [[ ! -e "$NINEROUTER_TEST_TERM_GO" ]]; do
+        /bin/sleep 0.01
+      done
     fi
     ;;
   is-active)
@@ -334,6 +360,7 @@ EOF
 
 run_updater() {
   local output_file="$1"
+  local updater_pid
   shift
   env \
     NINEROUTER_TEST_MODE=1 \
@@ -356,6 +383,8 @@ run_updater() {
     NINEROUTER_NODE="$TMP/bin/node" \
     NINEROUTER_TEST_SYSTEMCTL_LOG="$TMP/systemctl.log" \
     NINEROUTER_TEST_SYSTEMCTL_STATE="$TMP/systemctl.state" \
+    NINEROUTER_TEST_SYSTEMCTL_ENABLED_STATE="$TMP/systemctl.enabled" \
+    NINEROUTER_TEST_SYSTEMCTL_WANTS_LINK="$TMP/systemctl.wants-link" \
     NINEROUTER_TEST_PREVIOUS_DIR="$TMP/opt/9router.previous" \
     NINEROUTER_TEST_NPM_LOG="$TMP/npm.log" \
     NINEROUTER_TEST_CURL_LOG="$TMP/curl.log" \
@@ -363,8 +392,14 @@ run_updater() {
     NINEROUTER_TEST_FLOCK_LOG="$TMP/flock.log" \
     NINEROUTER_TEST_INSTALL_EVENTS="$TMP/install-events.log" \
     NINEROUTER_TEST_DAEMON_RELOAD_MARKER="$TMP/daemon-reload.failed" \
+    NINEROUTER_TEST_TERM_GO="$TMP/term-go" \
     PATH="$TMP/bin:$PATH" \
-    "$@" bash "$UPDATER" >"$output_file" 2>&1
+    "$@" bash "$UPDATER" >"$output_file" 2>&1 &
+  updater_pid=$!
+  if [[ -n "${NINEROUTER_TEST_UPDATER_PID_FILE:-}" ]]; then
+    printf '%s\n' "$updater_pid" >"$NINEROUTER_TEST_UPDATER_PID_FILE"
+  fi
+  wait "$updater_pid"
 }
 
 run_installer() {
@@ -399,6 +434,8 @@ run_installer() {
     NINEROUTER_CP="$TMP/bin/cp" \
     NINEROUTER_TEST_SYSTEMCTL_LOG="$TMP/systemctl.log" \
     NINEROUTER_TEST_SYSTEMCTL_STATE="$TMP/systemctl.state" \
+    NINEROUTER_TEST_SYSTEMCTL_ENABLED_STATE="$TMP/systemctl.enabled" \
+    NINEROUTER_TEST_SYSTEMCTL_WANTS_LINK="$TMP/systemctl.wants-link" \
     NINEROUTER_TEST_PREVIOUS_DIR="$TMP/opt/9router.previous" \
     NINEROUTER_TEST_NPM_LOG="$TMP/npm.log" \
     NINEROUTER_TEST_CURL_LOG="$TMP/curl.log" \
@@ -434,6 +471,9 @@ assert_old_unit_restored() {
     fail 'installer left a new-unit staging file'
   ! compgen -G "$TMP/etc/systemd/system/9router.service.backup.*" >/dev/null || \
     fail 'installer left a unit backup after rollback'
+  grep -Fqx 'enabled' "$TMP/systemctl.enabled" ||
+    fail 'installer did not restore the previous enabled state'
+  assert_file "$TMP/systemctl.wants-link"
 }
 
 test_installer_uses_only_test_paths_and_preserves_existing_data() {
@@ -456,6 +496,7 @@ test_installer_uses_only_test_paths_and_preserves_existing_data() {
   ! compgen -G "$TMP/etc/systemd/system/9router.service.backup.*" >/dev/null ||
     fail 'installer did not clean its unit backup after success'
   assert_event_log \
+    'systemctl is-enabled 9router' \
     'install updater' \
     'cp backup-unit' \
     'install unit' \
@@ -492,6 +533,7 @@ test_installer_rolls_back_unit_on_failure() {
       fail "installer did not reload systemd after $scenario rollback"
     if [[ "$scenario" == updater ]]; then
       assert_event_log \
+        'systemctl is-enabled 9router' \
         'install updater' \
         'cp backup-unit' \
         'install unit' \
@@ -500,6 +542,7 @@ test_installer_rolls_back_unit_on_failure() {
         'systemctl enable 9router' \
         'git clone' \
         'mv restore-unit' \
+        'systemctl enable 9router' \
         'systemctl daemon-reload'
     fi
     cleanup
@@ -510,6 +553,8 @@ test_installer_rolls_back_unit_on_failure() {
 test_first_install_failure_removes_new_unit() {
   new_install_tmp
   make_fakes
+  printf 'not-found\n' >"$TMP/systemctl.enabled"
+  rm -f -- "$TMP/systemctl.wants-link"
   mkdir -p "$TMP/root/.9router"
   printf 'keep-this-data\n' >"$TMP/root/.9router/existing-data"
   if run_installer "$TMP/output" env NINEROUTER_TEST_BUILD_FAIL=1; then
@@ -521,6 +566,34 @@ test_first_install_failure_removes_new_unit() {
     fail 'first install changed existing data-directory content'
   grep -q '^daemon-reload$' "$TMP/systemctl.log" ||
     fail 'first-install rollback did not reload systemd'
+  grep -Fqx 'disabled' "$TMP/systemctl.enabled" ||
+    fail 'first-install rollback did not disable the service'
+  assert_not_exists "$TMP/systemctl.wants-link"
+  cleanup
+  TMP=""
+}
+
+test_health_failure_after_switch_keeps_new_entrypoints() {
+  new_install_tmp
+  make_fakes
+  prepare_existing_unit
+  mkdir -p "$TMP/opt/9router"
+  printf 'old-runtime\n' >"$TMP/opt/9router/current-marker"
+  printf 'old-updater\n' >"$TMP/usr/local/sbin/9router-update"
+  chmod 0700 "$TMP/usr/local/sbin/9router-update"
+  if run_installer "$TMP/output-health" env NINEROUTER_TEST_CURL_MODE=fail; then
+    fail 'installer succeeded despite post-switch health failure'
+  fi
+  cmp "$SERVICE_UNIT" "$TMP/etc/systemd/system/9router.service" ||
+    fail 'post-switch health failure rolled back the new unit'
+  cmp "$UPDATER" "$TMP/usr/local/sbin/9router-update" ||
+    fail 'post-switch health failure rolled back the new updater'
+  grep -Fqx 'enabled' "$TMP/systemctl.enabled" ||
+    fail 'post-switch health failure changed enabled state'
+  assert_file "$TMP/opt/9router.previous/current-marker"
+  assert_file "$TMP/opt/9router/.runtime/custom-server.js"
+  grep -Fq '旧版本保留在' "$TMP/output-health" ||
+    fail 'post-switch health failure did not retain updater recovery details'
   cleanup
   TMP=""
 }
@@ -821,7 +894,19 @@ test_health_rejects_inactive_service_and_trap_preserves_recovery_state() {
   make_fakes
   mkdir -p "$TMP/opt/9router"
   : >"$TMP/opt/9router/current-marker"
-  if run_updater "$TMP/output-term" env NINEROUTER_TEST_SEND_TERM_ON_START=1; then
+  NINEROUTER_TEST_UPDATER_PID_FILE="$TMP/updater.pid" \
+    run_updater "$TMP/output-term" env NINEROUTER_TEST_SEND_TERM_ON_START=1 &
+  launcher_pid=$!
+  while [[ ! -s "$TMP/updater.pid" ]]; do
+    /bin/sleep 0.01
+  done
+  updater_pid="$(<"$TMP/updater.pid")"
+  while ! grep -q '^start 9router$' "$TMP/systemctl.log"; do
+    /bin/sleep 0.01
+  done
+  kill -TERM "$updater_pid"
+  : >"$TMP/term-go"
+  if wait "$launcher_pid"; then
     fail 'updater ignored SIGTERM during the critical switch'
   fi
   assert_file "$TMP/opt/9router.previous/current-marker"
@@ -845,6 +930,7 @@ test_installer_has_root_guard_and_preserves_data_directory
 test_installer_uses_only_test_paths_and_preserves_existing_data
 test_installer_rolls_back_unit_on_failure
 test_first_install_failure_removes_new_unit
+test_health_failure_after_switch_keeps_new_entrypoints
 test_installer_rejects_unsafe_test_roots
 test_successful_update_installs_flat_runtime_and_restarts_service
 test_rejects_unsafe_data_overlapping_and_symlink_paths
