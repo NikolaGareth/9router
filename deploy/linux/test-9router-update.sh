@@ -40,6 +40,20 @@ assert_empty_file() {
   test ! -s "$1" || fail "expected empty file: $1"
 }
 
+file_mode() {
+  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
+}
+
+assert_event_log() {
+  local expected
+  local actual
+
+  expected="$(printf '%s\n' "$@")"
+  actual="$(<"$TMP/install-events.log")"
+  [[ "$actual" == "$expected" ]] ||
+    fail "unexpected installer event order:\nexpected:\n$expected\nactual:\n$actual"
+}
+
 test_service_unit_uses_fixed_production_paths_without_credentials() {
   assert_file "$SERVICE_UNIT"
   grep -q '^ExecStart=/opt/node-v24.15.0-npm/node/bin/node /opt/9router/.runtime/custom-server.js$' "$SERVICE_UNIT" || \
@@ -57,24 +71,29 @@ test_installer_has_root_guard_and_preserves_data_directory() {
   grep -q 'EUID' "$INSTALLER" || fail 'installer does not verify root execution'
   grep -Eq 'MKDIR.*-p.*DATA_DIR' "$INSTALLER" || \
     fail 'installer does not create the data directory non-destructively'
-  if grep -Eq '\brm\b|\bcat\b|\bread\b' "$INSTALLER"; then
+  if grep -Eq '(rm|cat|read).*DATA_DIR|DATA_DIR.*(rm|cat|read)' "$INSTALLER"; then
     fail 'installer must not delete or read the data directory'
   fi
 }
 
 make_fakes() {
-  mkdir -p "$TMP/bin" "$TMP/opt" "$TMP/run"
+  mkdir -p "$TMP/bin" "$TMP/opt" "$TMP/run" "$TMP/usr/local/sbin" \
+    "$TMP/etc/systemd/system" "$TMP/root"
   : >"$TMP/systemctl.log"
   : >"$TMP/npm.log"
   : >"$TMP/curl.log"
   : >"$TMP/git.log"
   : >"$TMP/flock.log"
+  : >"$TMP/install-events.log"
   printf 'active\n' >"$TMP/systemctl.state"
 
   cat >"$TMP/bin/git" <<'EOF'
 #!/usr/bin/env bash
 set -eu
 printf '%s\n' "$*" >>"$NINEROUTER_TEST_GIT_LOG"
+if [[ "$1" == clone ]]; then
+  printf 'git clone\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS"
+fi
 if [[ "$1" == -C ]]; then
   printf 'test-revision\n'
   exit 0
@@ -159,11 +178,17 @@ EOF
 #!/usr/bin/env bash
 set -eu
 printf '%s\n' "$*" >>"$NINEROUTER_TEST_SYSTEMCTL_LOG"
+printf 'systemctl %s\n' "$*" >>"$NINEROUTER_TEST_INSTALL_EVENTS"
 case "$1" in
   daemon-reload)
+    if [[ "${NINEROUTER_TEST_DAEMON_RELOAD_FAIL_ONCE:-0}" == 1 && ! -e "$NINEROUTER_TEST_DAEMON_RELOAD_MARKER" ]]; then
+      : >"$NINEROUTER_TEST_DAEMON_RELOAD_MARKER"
+      exit 7
+    fi
     ;;
   enable)
     [[ "$2" == 9router ]]
+    [[ "${NINEROUTER_TEST_ENABLE_FAIL:-0}" != 1 ]] || exit 8
     ;;
   stop)
     [[ "$2" == 9router ]]
@@ -234,7 +259,68 @@ EOF
 exit 0
 EOF
 
-  for command_name in mkdir rm cp; do
+  cat >"$TMP/bin/install" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+if [[ "$*" == *'/9router-update '* ]]; then
+  printf 'install updater\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS"
+elif [[ "$*" == *'/9router.service '* ]]; then
+  printf 'install unit\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS"
+  [[ "${NINEROUTER_TEST_INSTALL_FAIL:-}" != unit ]] || exit 9
+fi
+exec /usr/bin/install "$@"
+EOF
+
+  cat >"$TMP/bin/cp" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+source_path="${@: -2:1}"
+if [[ "$source_path" == *'/9router.service' ]]; then
+  printf 'cp backup-unit\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS"
+fi
+if [[ "$1" == -a ]]; then
+  shift
+  exec /bin/cp -pR "$@"
+fi
+exec /bin/cp "$@"
+EOF
+
+  cat >"$TMP/bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+while [[ "$1" == -T || "$1" == -n || "$1" == -f || "$1" == -fT || "$1" == -- ]]; do
+  shift
+done
+source_path="$1"
+destination_path="$2"
+case "$source_path" in
+  *9router.service.new.*) printf 'mv install-unit\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS" ;;
+  *9router.service.backup.*) printf 'mv restore-unit\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS" ;;
+esac
+if [[ -e "$destination_path" || -L "$destination_path" ]]; then
+  /bin/mv -f "$source_path" "$destination_path"
+else
+  /bin/mv "$source_path" "$destination_path"
+fi
+EOF
+
+  cat >"$TMP/bin/rm" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+for argument in "$@"; do
+  if [[ "$argument" == *9router.service.backup.* ]]; then
+    printf 'rm cleanup-backup\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS"
+    break
+  fi
+  if [[ "$argument" == *'/9router.service' || "$argument" == *9router.service.new.* ]]; then
+    printf 'rm remove-unit\n' >>"$NINEROUTER_TEST_INSTALL_EVENTS"
+    break
+  fi
+done
+exec /bin/rm "$@"
+EOF
+
+  for command_name in mkdir; do
     cat >"$TMP/bin/$command_name" <<EOF
 #!/usr/bin/env bash
 exec /bin/$command_name "\$@"
@@ -243,7 +329,7 @@ EOF
 
   chmod +x "$TMP/bin/git" "$TMP/bin/flock" "$TMP/bin/npm" "$TMP/bin/node" "$TMP/bin/stat" \
     "$TMP/bin/mv" "$TMP/bin/systemctl" "$TMP/bin/curl" "$TMP/bin/sleep" \
-    "$TMP/bin/mkdir" "$TMP/bin/rm" "$TMP/bin/cp"
+    "$TMP/bin/mkdir" "$TMP/bin/rm" "$TMP/bin/cp" "$TMP/bin/install"
 }
 
 run_updater() {
@@ -275,12 +361,15 @@ run_updater() {
     NINEROUTER_TEST_CURL_LOG="$TMP/curl.log" \
     NINEROUTER_TEST_GIT_LOG="$TMP/git.log" \
     NINEROUTER_TEST_FLOCK_LOG="$TMP/flock.log" \
+    NINEROUTER_TEST_INSTALL_EVENTS="$TMP/install-events.log" \
+    NINEROUTER_TEST_DAEMON_RELOAD_MARKER="$TMP/daemon-reload.failed" \
     PATH="$TMP/bin:$PATH" \
     "$@" bash "$UPDATER" >"$output_file" 2>&1
 }
 
 run_installer() {
   local output_file="$1"
+  shift
 
   env \
     NINEROUTER_TEST_MODE=1 \
@@ -295,6 +384,10 @@ run_installer() {
     NINEROUTER_CURL="$TMP/bin/curl" \
     NINEROUTER_FLOCK="$TMP/bin/flock" \
     NINEROUTER_MKDIR="$TMP/bin/mkdir" \
+    NINEROUTER_CP="$TMP/bin/cp" \
+    NINEROUTER_MV="$TMP/bin/mv" \
+    NINEROUTER_RM="$TMP/bin/rm" \
+    NINEROUTER_INSTALL="$TMP/bin/install" \
     NINEROUTER_ROOT="$TMP/opt/9router" \
     NINEROUTER_BUILD_DIR="$TMP/opt/9router-build" \
     NINEROUTER_PREVIOUS_DIR="$TMP/opt/9router.previous" \
@@ -311,31 +404,140 @@ run_installer() {
     NINEROUTER_TEST_CURL_LOG="$TMP/curl.log" \
     NINEROUTER_TEST_GIT_LOG="$TMP/git.log" \
     NINEROUTER_TEST_FLOCK_LOG="$TMP/flock.log" \
+    NINEROUTER_TEST_INSTALL_EVENTS="$TMP/install-events.log" \
+    NINEROUTER_TEST_DAEMON_RELOAD_MARKER="$TMP/daemon-reload.failed" \
     PATH="$TMP/bin:$PATH" \
-    bash "$INSTALLER" >"$output_file" 2>&1
+    "$@" bash "$INSTALLER" >"$output_file" 2>&1
 }
 
-test_root_installer_uses_only_test_paths_and_preserves_existing_data() {
-  if [[ "$EUID" -ne 0 ]]; then
-    return
-  fi
+new_install_tmp() {
+  TMP="$(mktemp -d /private/tmp/9router-install-test.XXXXXX)"
+}
 
-  TMP="$(mktemp -d /tmp/9router-install-test.XXXXXX)"
-  make_fakes
-  mkdir -p "$TMP/root/.9router"
+prepare_existing_unit() {
+  mkdir -p "$TMP/etc/systemd/system" "$TMP/root/.9router"
+  printf '[Service]\nExecStart=/legacy/router\n' >"$TMP/etc/systemd/system/9router.service"
+  chmod 0600 "$TMP/etc/systemd/system/9router.service"
+  cp "$TMP/etc/systemd/system/9router.service" "$TMP/original-unit"
   printf 'keep-this-data\n' >"$TMP/root/.9router/existing-data"
-  if ! run_installer "$TMP/output"; then
-    fail 'root installer failed in isolated test mode'
+}
+
+assert_old_unit_restored() {
+  cmp "$TMP/original-unit" "$TMP/etc/systemd/system/9router.service" || \
+    fail 'installer did not restore the original unit bytes'
+  [[ "$(file_mode "$TMP/etc/systemd/system/9router.service")" == 600 ]] || \
+    fail 'installer did not restore the original unit permissions'
+  assert_file "$TMP/root/.9router/existing-data"
+  grep -Fqx 'keep-this-data' "$TMP/root/.9router/existing-data" || \
+    fail 'installer changed existing data-directory content'
+  ! compgen -G "$TMP/etc/systemd/system/9router.service.new.*" >/dev/null || \
+    fail 'installer left a new-unit staging file'
+  ! compgen -G "$TMP/etc/systemd/system/9router.service.backup.*" >/dev/null || \
+    fail 'installer left a unit backup after rollback'
+}
+
+test_installer_uses_only_test_paths_and_preserves_existing_data() {
+  new_install_tmp
+  make_fakes
+  prepare_existing_unit
+  if ! (cd / && run_installer "$TMP/output"); then
+    fail 'installer failed in isolated test mode'
   fi
 
   assert_file "$TMP/usr/local/sbin/9router-update"
   assert_file "$TMP/etc/systemd/system/9router.service"
+  cmp "$SERVICE_UNIT" "$TMP/etc/systemd/system/9router.service" ||
+    fail 'installer did not install the new unit'
+  [[ "$(file_mode "$TMP/etc/systemd/system/9router.service")" == 644 ]] ||
+    fail 'installer did not set the new unit permissions'
   assert_file "$TMP/root/.9router/existing-data"
-  grep -Fqx 'keep-this-data' "$TMP/root/.9router/existing-data" || \
+  grep -Fqx 'keep-this-data' "$TMP/root/.9router/existing-data" ||
     fail 'installer changed existing data-directory content'
-  grep -q '^daemon-reload$' "$TMP/systemctl.log" || fail 'installer did not reload systemd units'
-  grep -q '^enable 9router$' "$TMP/systemctl.log" || fail 'installer did not enable the service'
-  grep -q '^start 9router$' "$TMP/systemctl.log" || fail 'installer did not invoke the updater'
+  ! compgen -G "$TMP/etc/systemd/system/9router.service.backup.*" >/dev/null ||
+    fail 'installer did not clean its unit backup after success'
+  assert_event_log \
+    'install updater' \
+    'cp backup-unit' \
+    'install unit' \
+    'mv install-unit' \
+    'systemctl daemon-reload' \
+    'systemctl enable 9router' \
+    'git clone' \
+    'systemctl start 9router' \
+    'systemctl is-active --quiet 9router' \
+    'rm cleanup-backup'
+  cleanup
+  TMP=""
+}
+
+test_installer_rolls_back_unit_on_failure() {
+  local scenario
+  local failure_env
+
+  for scenario in unit daemon_reload enable updater; do
+    case "$scenario" in
+      unit) failure_env=NINEROUTER_TEST_INSTALL_FAIL=unit ;;
+      daemon_reload) failure_env=NINEROUTER_TEST_DAEMON_RELOAD_FAIL_ONCE=1 ;;
+      enable) failure_env=NINEROUTER_TEST_ENABLE_FAIL=1 ;;
+      updater) failure_env=NINEROUTER_TEST_BUILD_FAIL=1 ;;
+    esac
+    new_install_tmp
+    make_fakes
+    prepare_existing_unit
+    if run_installer "$TMP/output-$scenario" env "$failure_env"; then
+      fail "installer succeeded despite $scenario failure"
+    fi
+    assert_old_unit_restored
+    grep -q '^daemon-reload$' "$TMP/systemctl.log" ||
+      fail "installer did not reload systemd after $scenario rollback"
+    if [[ "$scenario" == updater ]]; then
+      assert_event_log \
+        'install updater' \
+        'cp backup-unit' \
+        'install unit' \
+        'mv install-unit' \
+        'systemctl daemon-reload' \
+        'systemctl enable 9router' \
+        'git clone' \
+        'mv restore-unit' \
+        'systemctl daemon-reload'
+    fi
+    cleanup
+    TMP=""
+  done
+}
+
+test_first_install_failure_removes_new_unit() {
+  new_install_tmp
+  make_fakes
+  mkdir -p "$TMP/root/.9router"
+  printf 'keep-this-data\n' >"$TMP/root/.9router/existing-data"
+  if run_installer "$TMP/output" env NINEROUTER_TEST_BUILD_FAIL=1; then
+    fail 'first installer run succeeded despite updater failure'
+  fi
+  assert_not_exists "$TMP/etc/systemd/system/9router.service"
+  assert_file "$TMP/root/.9router/existing-data"
+  grep -Fqx 'keep-this-data' "$TMP/root/.9router/existing-data" ||
+    fail 'first install changed existing data-directory content'
+  grep -q '^daemon-reload$' "$TMP/systemctl.log" ||
+    fail 'first-install rollback did not reload systemd'
+  cleanup
+  TMP=""
+}
+
+test_installer_rejects_unsafe_test_roots() {
+  local unsafe_root
+
+  new_install_tmp
+  make_fakes
+  for unsafe_root in /opt /etc /run; do
+    if run_installer "$TMP/output-${unsafe_root#/}" env "NINEROUTER_TEST_ROOT=$unsafe_root"; then
+      fail "installer accepted unsafe test root: $unsafe_root"
+    fi
+    test -s "$TMP/output-${unsafe_root#/}" ||
+      fail "installer did not reject unsafe test root before commands: $unsafe_root"
+  done
+  assert_empty_file "$TMP/install-events.log"
   cleanup
   TMP=""
 }
@@ -640,7 +842,10 @@ fi
 
 test_service_unit_uses_fixed_production_paths_without_credentials
 test_installer_has_root_guard_and_preserves_data_directory
-test_root_installer_uses_only_test_paths_and_preserves_existing_data
+test_installer_uses_only_test_paths_and_preserves_existing_data
+test_installer_rolls_back_unit_on_failure
+test_first_install_failure_removes_new_unit
+test_installer_rejects_unsafe_test_roots
 test_successful_update_installs_flat_runtime_and_restarts_service
 test_rejects_unsafe_data_overlapping_and_symlink_paths
 test_rejects_unsafe_or_overlapping_lock_before_opening_it
