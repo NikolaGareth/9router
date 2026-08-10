@@ -5,6 +5,8 @@ set -u
 # repository-local temporary directory so the suite is safe in CI.
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 UPDATER="$ROOT_DIR/deploy/linux/9router-update"
+SERVICE_UNIT="$ROOT_DIR/deploy/linux/9router.service"
+INSTALLER="$ROOT_DIR/deploy/linux/install.sh"
 TMP=""
 
 cleanup() {
@@ -36,6 +38,28 @@ assert_not_exists() {
 
 assert_empty_file() {
   test ! -s "$1" || fail "expected empty file: $1"
+}
+
+test_service_unit_uses_fixed_production_paths_without_credentials() {
+  assert_file "$SERVICE_UNIT"
+  grep -q '^ExecStart=/opt/node-v24.15.0-npm/node/bin/node /opt/9router/.runtime/custom-server.js$' "$SERVICE_UNIT" || \
+    fail 'service unit does not use the fixed production Node entry point'
+  grep -q '^Environment=DATA_DIR=/root/.9router$' "$SERVICE_UNIT" || \
+    fail 'service unit does not use the fixed production data directory'
+  if grep -Eqi 'password|api[_-]?key|token|secret' "$SERVICE_UNIT"; then
+    fail 'service unit must not contain credentials'
+  fi
+}
+
+test_installer_has_root_guard_and_preserves_data_directory() {
+  assert_file "$INSTALLER"
+  bash -n "$INSTALLER" || fail 'installer has invalid shell syntax'
+  grep -q 'EUID' "$INSTALLER" || fail 'installer does not verify root execution'
+  grep -Eq 'MKDIR.*-p.*DATA_DIR' "$INSTALLER" || \
+    fail 'installer does not create the data directory non-destructively'
+  if grep -Eq '\brm\b|\bcat\b|\bread\b' "$INSTALLER"; then
+    fail 'installer must not delete or read the data directory'
+  fi
 }
 
 make_fakes() {
@@ -136,6 +160,11 @@ EOF
 set -eu
 printf '%s\n' "$*" >>"$NINEROUTER_TEST_SYSTEMCTL_LOG"
 case "$1" in
+  daemon-reload)
+    ;;
+  enable)
+    [[ "$2" == 9router ]]
+    ;;
   stop)
     [[ "$2" == 9router ]]
     [[ "${NINEROUTER_TEST_STOP_FAIL:-0}" != 1 ]] || exit 5
@@ -248,6 +277,67 @@ run_updater() {
     NINEROUTER_TEST_FLOCK_LOG="$TMP/flock.log" \
     PATH="$TMP/bin:$PATH" \
     "$@" bash "$UPDATER" >"$output_file" 2>&1
+}
+
+run_installer() {
+  local output_file="$1"
+
+  env \
+    NINEROUTER_TEST_MODE=1 \
+    NINEROUTER_TEST_ROOT="$TMP" \
+    NINEROUTER_UPDATER_TARGET="$TMP/usr/local/sbin/9router-update" \
+    NINEROUTER_SERVICE_TARGET="$TMP/etc/systemd/system/9router.service" \
+    NINEROUTER_DATA_DIR="$TMP/root/.9router" \
+    NINEROUTER_SYSTEMCTL="$TMP/bin/systemctl" \
+    NINEROUTER_NODE="$TMP/bin/node" \
+    NINEROUTER_NPM="$TMP/bin/npm" \
+    NINEROUTER_GIT="$TMP/bin/git" \
+    NINEROUTER_CURL="$TMP/bin/curl" \
+    NINEROUTER_FLOCK="$TMP/bin/flock" \
+    NINEROUTER_MKDIR="$TMP/bin/mkdir" \
+    NINEROUTER_ROOT="$TMP/opt/9router" \
+    NINEROUTER_BUILD_DIR="$TMP/opt/9router-build" \
+    NINEROUTER_PREVIOUS_DIR="$TMP/opt/9router.previous" \
+    NINEROUTER_LOCK_FILE="$TMP/run/9router-update.lock" \
+    NINEROUTER_MV="$TMP/bin/mv" \
+    NINEROUTER_STAT="$TMP/bin/stat" \
+    NINEROUTER_SLEEP="$TMP/bin/sleep" \
+    NINEROUTER_RM="$TMP/bin/rm" \
+    NINEROUTER_CP="$TMP/bin/cp" \
+    NINEROUTER_TEST_SYSTEMCTL_LOG="$TMP/systemctl.log" \
+    NINEROUTER_TEST_SYSTEMCTL_STATE="$TMP/systemctl.state" \
+    NINEROUTER_TEST_PREVIOUS_DIR="$TMP/opt/9router.previous" \
+    NINEROUTER_TEST_NPM_LOG="$TMP/npm.log" \
+    NINEROUTER_TEST_CURL_LOG="$TMP/curl.log" \
+    NINEROUTER_TEST_GIT_LOG="$TMP/git.log" \
+    NINEROUTER_TEST_FLOCK_LOG="$TMP/flock.log" \
+    PATH="$TMP/bin:$PATH" \
+    bash "$INSTALLER" >"$output_file" 2>&1
+}
+
+test_root_installer_uses_only_test_paths_and_preserves_existing_data() {
+  if [[ "$EUID" -ne 0 ]]; then
+    return
+  fi
+
+  TMP="$(mktemp -d /tmp/9router-install-test.XXXXXX)"
+  make_fakes
+  mkdir -p "$TMP/root/.9router"
+  printf 'keep-this-data\n' >"$TMP/root/.9router/existing-data"
+  if ! run_installer "$TMP/output"; then
+    fail 'root installer failed in isolated test mode'
+  fi
+
+  assert_file "$TMP/usr/local/sbin/9router-update"
+  assert_file "$TMP/etc/systemd/system/9router.service"
+  assert_file "$TMP/root/.9router/existing-data"
+  grep -Fqx 'keep-this-data' "$TMP/root/.9router/existing-data" || \
+    fail 'installer changed existing data-directory content'
+  grep -q '^daemon-reload$' "$TMP/systemctl.log" || fail 'installer did not reload systemd units'
+  grep -q '^enable 9router$' "$TMP/systemctl.log" || fail 'installer did not enable the service'
+  grep -q '^start 9router$' "$TMP/systemctl.log" || fail 'installer did not invoke the updater'
+  cleanup
+  TMP=""
 }
 
 test_successful_update_installs_flat_runtime_and_restarts_service() {
@@ -548,6 +638,9 @@ if [[ ! -f "$UPDATER" ]]; then
   fail "deploy/linux/9router-update is missing"
 fi
 
+test_service_unit_uses_fixed_production_paths_without_credentials
+test_installer_has_root_guard_and_preserves_data_directory
+test_root_installer_uses_only_test_paths_and_preserves_existing_data
 test_successful_update_installs_flat_runtime_and_restarts_service
 test_rejects_unsafe_data_overlapping_and_symlink_paths
 test_rejects_unsafe_or_overlapping_lock_before_opening_it

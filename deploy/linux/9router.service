@@ -1,0 +1,22 @@
+[Unit]
+Description=9Router Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/9router/.runtime
+Environment=NODE_ENV=production
+Environment=HOSTNAME=0.0.0.0
+Environment=PORT=80
+Environment=DATA_DIR=/root/.9router
+Environment=NEXT_TELEMETRY_DISABLED=1
+ExecStart=/opt/node-v24.15.0-npm/node/bin/node /opt/9router/.runtime/custom-server.js
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
