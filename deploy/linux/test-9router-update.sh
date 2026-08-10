@@ -1257,6 +1257,82 @@ test_joint_recovery_terminal_revalidates_systemd_and_rejects_bad_step() {
   TMP=""
 }
 
+test_generated_script_intermediate_write_failures_are_not_published() {
+  new_install_tmp
+  make_fakes
+  prepare_legacy_installation
+  if run_installer "$TMP/output-joint-write-failure" env \
+    NINEROUTER_TEST_CURL_MODE=fail \
+    NINEROUTER_TEST_FAIL_SCRIPT_WRITE_AT=5; then
+    fail 'installer succeeded despite joint-script write-failure setup'
+  fi
+  assert_not_exists "$TMP/run/9router-install-recover"
+  assert_not_exists "$TMP/run/9router-install-recover.step"
+  assert_not_exists "$TMP/run/9router-install-recovery.unit.work"
+  assert_not_exists "$TMP/run/9router-install-recovery.updater.work"
+  cmp "$TMP/original-unit" "$TMP/run/9router-install-recovery.unit" || \
+    fail 'joint-script write failure consumed the old unit material'
+  cmp "$TMP/original-updater" "$TMP/run/9router-install-recovery.updater" || \
+    fail 'joint-script write failure consumed the old updater material'
+  cmp "$SERVICE_UNIT" "$TMP/etc/systemd/system/9router.service" || \
+    fail 'joint-script write failure changed the retained new unit'
+  cmp "$UPDATER" "$TMP/usr/local/sbin/9router-update" || \
+    fail 'joint-script write failure changed the retained new updater'
+  cleanup
+  TMP=""
+
+  new_install_tmp
+  make_fakes
+  prepare_legacy_installation
+  if run_installer "$TMP/output-joint-write-retry" env \
+    NINEROUTER_TEST_CURL_MODE=fail; then
+    fail 'joint-script normal retry setup unexpectedly succeeded'
+  fi
+  assert_file "$TMP/run/9router-install-recover"
+  [[ "$(file_mode "$TMP/run/9router-install-recover")" == 700 ]] || \
+    fail 'joint-script normal retry did not publish a complete 0700 script'
+  cleanup
+  TMP=""
+
+  new_install_tmp
+  make_fakes
+  printf 'not-found\n' >"$TMP/systemctl.enabled"
+  rm -f -- "$TMP/systemctl.wants-link"
+  if run_installer "$TMP/output-cleanup-write-failure" env \
+    NINEROUTER_TEST_CURL_MODE=fail \
+    NINEROUTER_TEST_FAIL_SCRIPT_WRITE_AT=5; then
+    fail 'installer succeeded despite cleanup-script write-failure setup'
+  fi
+  assert_not_exists "$TMP/run/9router-install-cleanup"
+  assert_not_exists "$TMP/run/9router-install-cleanup.step"
+  assert_not_exists "$TMP/run/9router-install-recovery.unit"
+  assert_not_exists "$TMP/run/9router-install-recovery.updater"
+  grep -Fqx 'not-found' "$TMP/run/9router-install-recovery.enable-state" || \
+    fail 'cleanup-script write failure consumed the enable-state material'
+  grep -Fqx 'health_failed' "$TMP/run/9router-update.phase" || \
+    fail 'cleanup-script write failure consumed the phase material'
+  cmp "$SERVICE_UNIT" "$TMP/etc/systemd/system/9router.service" || \
+    fail 'cleanup-script write failure changed the retained new unit'
+  cmp "$UPDATER" "$TMP/usr/local/sbin/9router-update" || \
+    fail 'cleanup-script write failure changed the retained new updater'
+  cleanup
+  TMP=""
+
+  new_install_tmp
+  make_fakes
+  printf 'not-found\n' >"$TMP/systemctl.enabled"
+  rm -f -- "$TMP/systemctl.wants-link"
+  if run_installer "$TMP/output-cleanup-write-retry" env \
+    NINEROUTER_TEST_CURL_MODE=fail; then
+    fail 'cleanup-script normal retry setup unexpectedly succeeded'
+  fi
+  assert_file "$TMP/run/9router-install-cleanup"
+  [[ "$(file_mode "$TMP/run/9router-install-cleanup")" == 700 ]] || \
+    fail 'cleanup-script normal retry did not publish a complete 0700 script'
+  cleanup
+  TMP=""
+}
+
 test_joint_recovery_script_resumes_after_each_partial_failure() {
   local legacy_exec
 
@@ -2043,6 +2119,7 @@ test_switch_barrier_preserves_new_entrypoints_and_fixed_recovery_materials
 test_move_intent_failures_use_strict_scene_classification
 test_post_switch_failure_supports_legacy_joint_recovery
 test_joint_recovery_terminal_revalidates_systemd_and_rejects_bad_step
+test_generated_script_intermediate_write_failures_are_not_published
 test_joint_recovery_script_resumes_after_each_partial_failure
 test_joint_recovery_rejects_replaced_lock_inode
 test_joint_recovery_script_refuses_concurrent_updater_lock

@@ -325,11 +325,23 @@ cleanup_first_install_generation() {
   return "$cleanup_failed"
 }
 
+script_printf() {
+  script_write_count=$((script_write_count + 1))
+  if [[ "$TEST_MODE" == 1 && "$script_write_fail_at" =~ ^[1-9][0-9]*$ &&
+    "$script_write_count" -eq "$script_write_fail_at" ]]; then
+    return 97
+  fi
+  printf "$@"
+}
+
 write_joint_recovery_script() {
   local lock_identity phase_identity unit_identity recovery_updater_identity
   local enable_identity previous_identity service_identity updater_identity
   local work_unit_identity work_updater_identity recovery_token
   local root_state=absent root_identity='' build_state=absent build_identity=''
+  local script_write_count=0
+  local script_write_fail_at="${NINEROUTER_TEST_FAIL_SCRIPT_WRITE_AT:-0}"
+  local script_write_failed=0
   local path
 
   (( UNIT_EXISTED == 1 && UPDATER_EXISTED == 1 &&
@@ -420,35 +432,40 @@ write_joint_recovery_script() {
     return 1
   }
   if ! {
-    printf '#!/usr/bin/env bash\n'
-    printf 'set -Eeuo pipefail\numask 077\n'
-    printf 'TEST_MODE=%q\n' "$TEST_MODE"
-    printf 'LOCK_FILE=%q\nPHASE_FILE=%q\n' "$LOCK_FILE" "$PHASE_FILE"
-    printf 'RECOVERY_UNIT=%q\nRECOVERY_UPDATER=%q\nRECOVERY_ENABLE_STATE=%q\n' \
-      "$RECOVERY_UNIT" "$RECOVERY_UPDATER" "$RECOVERY_ENABLE_STATE"
-    printf 'RECOVERY_WORK_UNIT=%q\nRECOVERY_WORK_UPDATER=%q\nSTEP_PATH=%q\n' \
-      "$RECOVERY_WORK_UNIT" "$RECOVERY_WORK_UPDATER" "$RECOVERY_STEP"
-    printf 'SCRIPT_PATH=%q\nDEPLOY_ROOT=%q\nFAILED_ROOT=%q\n' \
-      "$RECOVERY_SCRIPT" "$DEPLOY_ROOT" "$FAILED_ROOT"
-    printf 'BUILD_DIR=%q\nPREVIOUS_DIR=%q\n' "$BUILD_DIR" "$PREVIOUS_DIR"
-    printf 'SERVICE_TARGET=%q\nUPDATER_TARGET=%q\n' "$SERVICE_TARGET" "$UPDATER_TARGET"
-    printf 'SYSTEMCTL=%q\nFLOCK=%q\nSTAT=%q\nMV=%q\nRM=%q\n' \
-      "$SYSTEMCTL" "$FLOCK" "$STAT" "$MV" "$RM"
-    printf 'EXPECTED_LOCK_ID=%q\nEXPECTED_PHASE=%q\nEXPECTED_PHASE_ID=%q\n' \
-      "$lock_identity" "$UPDATER_PHASE" "$phase_identity"
-    printf 'EXPECTED_UNIT_ID=%q\nEXPECTED_RECOVERY_UPDATER_ID=%q\nEXPECTED_ENABLE_ID=%q\n' \
-      "$unit_identity" "$recovery_updater_identity" "$enable_identity"
-    printf 'EXPECTED_WORK_UNIT_ID=%q\nEXPECTED_WORK_UPDATER_ID=%q\n' \
-      "$work_unit_identity" "$work_updater_identity"
-    printf 'EXPECTED_PREVIOUS_ID=%q\nEXPECTED_SERVICE_ID=%q\nEXPECTED_UPDATER_ID=%q\n' \
-      "$previous_identity" "$service_identity" "$updater_identity"
-    printf 'EXPECTED_ROOT_STATE=%q\nEXPECTED_ROOT_ID=%q\n' "$root_state" "$root_identity"
-    printf 'EXPECTED_BUILD_STATE=%q\nEXPECTED_BUILD_ID=%q\n' "$build_state" "$build_identity"
-    printf 'EXPECTED_ENABLE_STATE=%q\nEXPECTED_SERVICE_WAS_ACTIVE=%q\n' \
-      "$ENABLE_STATE" "$SERVICE_WAS_ACTIVE"
-    printf 'EXPECTED_TOKEN=%q\n' "$recovery_token"
+    script_printf '#!/usr/bin/env bash\n' || script_write_failed=1
+    script_printf 'set -Eeuo pipefail\numask 077\n' || script_write_failed=1
+    script_printf 'TEST_MODE=%q\n' "$TEST_MODE" || script_write_failed=1
+    script_printf 'LOCK_FILE=%q\nPHASE_FILE=%q\n' "$LOCK_FILE" "$PHASE_FILE" ||
+      script_write_failed=1
+    script_printf 'RECOVERY_UNIT=%q\nRECOVERY_UPDATER=%q\nRECOVERY_ENABLE_STATE=%q\n' \
+      "$RECOVERY_UNIT" "$RECOVERY_UPDATER" "$RECOVERY_ENABLE_STATE" || script_write_failed=1
+    script_printf 'RECOVERY_WORK_UNIT=%q\nRECOVERY_WORK_UPDATER=%q\nSTEP_PATH=%q\n' \
+      "$RECOVERY_WORK_UNIT" "$RECOVERY_WORK_UPDATER" "$RECOVERY_STEP" || script_write_failed=1
+    script_printf 'SCRIPT_PATH=%q\nDEPLOY_ROOT=%q\nFAILED_ROOT=%q\n' \
+      "$RECOVERY_SCRIPT" "$DEPLOY_ROOT" "$FAILED_ROOT" || script_write_failed=1
+    script_printf 'BUILD_DIR=%q\nPREVIOUS_DIR=%q\n' "$BUILD_DIR" "$PREVIOUS_DIR" ||
+      script_write_failed=1
+    script_printf 'SERVICE_TARGET=%q\nUPDATER_TARGET=%q\n' \
+      "$SERVICE_TARGET" "$UPDATER_TARGET" || script_write_failed=1
+    script_printf 'SYSTEMCTL=%q\nFLOCK=%q\nSTAT=%q\nMV=%q\nRM=%q\n' \
+      "$SYSTEMCTL" "$FLOCK" "$STAT" "$MV" "$RM" || script_write_failed=1
+    script_printf 'EXPECTED_LOCK_ID=%q\nEXPECTED_PHASE=%q\nEXPECTED_PHASE_ID=%q\n' \
+      "$lock_identity" "$UPDATER_PHASE" "$phase_identity" || script_write_failed=1
+    script_printf 'EXPECTED_UNIT_ID=%q\nEXPECTED_RECOVERY_UPDATER_ID=%q\nEXPECTED_ENABLE_ID=%q\n' \
+      "$unit_identity" "$recovery_updater_identity" "$enable_identity" || script_write_failed=1
+    script_printf 'EXPECTED_WORK_UNIT_ID=%q\nEXPECTED_WORK_UPDATER_ID=%q\n' \
+      "$work_unit_identity" "$work_updater_identity" || script_write_failed=1
+    script_printf 'EXPECTED_PREVIOUS_ID=%q\nEXPECTED_SERVICE_ID=%q\nEXPECTED_UPDATER_ID=%q\n' \
+      "$previous_identity" "$service_identity" "$updater_identity" || script_write_failed=1
+    script_printf 'EXPECTED_ROOT_STATE=%q\nEXPECTED_ROOT_ID=%q\n' \
+      "$root_state" "$root_identity" || script_write_failed=1
+    script_printf 'EXPECTED_BUILD_STATE=%q\nEXPECTED_BUILD_ID=%q\n' \
+      "$build_state" "$build_identity" || script_write_failed=1
+    script_printf 'EXPECTED_ENABLE_STATE=%q\nEXPECTED_SERVICE_WAS_ACTIVE=%q\n' \
+      "$ENABLE_STATE" "$SERVICE_WAS_ACTIVE" || script_write_failed=1
+    script_printf 'EXPECTED_TOKEN=%q\n' "$recovery_token" || script_write_failed=1
     while IFS= read -r line; do
-      printf '%s\n' "$line"
+      script_printf '%s\n' "$line" || script_write_failed=1
     done <<'RECOVERY_BODY'
 
 die() {
@@ -898,6 +915,7 @@ if [[ "$stage" == systemd_restored ]]; then
   fi
 fi
 RECOVERY_BODY
+    (( script_write_failed == 0 ))
   } >"$RECOVERY_SCRIPT_TEMP"; then
     cleanup_joint_generation || true
     return 1
@@ -923,6 +941,9 @@ write_first_install_cleanup_script() {
   local build_state=absent build_identity=''
   local previous_state=absent previous_identity=''
   local inspection_previous
+  local script_write_count=0
+  local script_write_fail_at="${NINEROUTER_TEST_FAIL_SCRIPT_WRITE_AT:-0}"
+  local script_write_failed=0
   local path
 
   (( UNIT_EXISTED == 0 && UPDATER_EXISTED == 0 &&
@@ -983,31 +1004,35 @@ write_first_install_cleanup_script() {
     return 1
   }
   if ! {
-    printf '#!/usr/bin/env bash\n'
-    printf 'set -Eeuo pipefail\numask 077\n'
-    printf 'TEST_MODE=%q\n' "$TEST_MODE"
-    printf 'LOCK_FILE=%q\nPHASE_FILE=%q\n' "$LOCK_FILE" "$PHASE_FILE"
-    printf 'RECOVERY_UNIT=%q\nRECOVERY_UPDATER=%q\nRECOVERY_ENABLE_STATE=%q\n' \
-      "$RECOVERY_UNIT" "$RECOVERY_UPDATER" "$RECOVERY_ENABLE_STATE"
-    printf 'SCRIPT_PATH=%q\nSTEP_PATH=%q\nDEPLOY_ROOT=%q\n' \
-      "$FIRST_INSTALL_CLEANUP_SCRIPT" "$FIRST_INSTALL_CLEANUP_STEP" "$DEPLOY_ROOT"
-    printf 'BUILD_DIR=%q\nPREVIOUS_DIR=%q\nINSPECTION_PREVIOUS=%q\n' \
-      "$BUILD_DIR" "$PREVIOUS_DIR" "$inspection_previous"
-    printf 'SERVICE_TARGET=%q\nUPDATER_TARGET=%q\n' "$SERVICE_TARGET" "$UPDATER_TARGET"
-    printf 'SYSTEMCTL=%q\nFLOCK=%q\nSTAT=%q\nMV=%q\nRM=%q\n' \
-      "$SYSTEMCTL" "$FLOCK" "$STAT" "$MV" "$RM"
-    printf 'EXPECTED_LOCK_ID=%q\nEXPECTED_PHASE=%q\nEXPECTED_PHASE_ID=%q\n' \
-      "$lock_identity" "$UPDATER_PHASE" "$phase_identity"
-    printf 'EXPECTED_ENABLE_ID=%q\nEXPECTED_ROOT_ID=%q\n' \
-      "$enable_identity" "$root_identity"
-    printf 'EXPECTED_SERVICE_ID=%q\nEXPECTED_UPDATER_ID=%q\n' \
-      "$service_identity" "$updater_identity"
-    printf 'EXPECTED_ENABLE_STATE=%q\nEXPECTED_PREVIOUS_STATE=%q\nEXPECTED_PREVIOUS_ID=%q\n' \
-      "$ENABLE_STATE" "$previous_state" "$previous_identity"
-    printf 'EXPECTED_BUILD_STATE=%q\nEXPECTED_BUILD_ID=%q\n' "$build_state" "$build_identity"
-    printf 'EXPECTED_TOKEN=%q\n' "$cleanup_token"
+    script_printf '#!/usr/bin/env bash\n' || script_write_failed=1
+    script_printf 'set -Eeuo pipefail\numask 077\n' || script_write_failed=1
+    script_printf 'TEST_MODE=%q\n' "$TEST_MODE" || script_write_failed=1
+    script_printf 'LOCK_FILE=%q\nPHASE_FILE=%q\n' "$LOCK_FILE" "$PHASE_FILE" ||
+      script_write_failed=1
+    script_printf 'RECOVERY_UNIT=%q\nRECOVERY_UPDATER=%q\nRECOVERY_ENABLE_STATE=%q\n' \
+      "$RECOVERY_UNIT" "$RECOVERY_UPDATER" "$RECOVERY_ENABLE_STATE" || script_write_failed=1
+    script_printf 'SCRIPT_PATH=%q\nSTEP_PATH=%q\nDEPLOY_ROOT=%q\n' \
+      "$FIRST_INSTALL_CLEANUP_SCRIPT" "$FIRST_INSTALL_CLEANUP_STEP" "$DEPLOY_ROOT" ||
+      script_write_failed=1
+    script_printf 'BUILD_DIR=%q\nPREVIOUS_DIR=%q\nINSPECTION_PREVIOUS=%q\n' \
+      "$BUILD_DIR" "$PREVIOUS_DIR" "$inspection_previous" || script_write_failed=1
+    script_printf 'SERVICE_TARGET=%q\nUPDATER_TARGET=%q\n' \
+      "$SERVICE_TARGET" "$UPDATER_TARGET" || script_write_failed=1
+    script_printf 'SYSTEMCTL=%q\nFLOCK=%q\nSTAT=%q\nMV=%q\nRM=%q\n' \
+      "$SYSTEMCTL" "$FLOCK" "$STAT" "$MV" "$RM" || script_write_failed=1
+    script_printf 'EXPECTED_LOCK_ID=%q\nEXPECTED_PHASE=%q\nEXPECTED_PHASE_ID=%q\n' \
+      "$lock_identity" "$UPDATER_PHASE" "$phase_identity" || script_write_failed=1
+    script_printf 'EXPECTED_ENABLE_ID=%q\nEXPECTED_ROOT_ID=%q\n' \
+      "$enable_identity" "$root_identity" || script_write_failed=1
+    script_printf 'EXPECTED_SERVICE_ID=%q\nEXPECTED_UPDATER_ID=%q\n' \
+      "$service_identity" "$updater_identity" || script_write_failed=1
+    script_printf 'EXPECTED_ENABLE_STATE=%q\nEXPECTED_PREVIOUS_STATE=%q\nEXPECTED_PREVIOUS_ID=%q\n' \
+      "$ENABLE_STATE" "$previous_state" "$previous_identity" || script_write_failed=1
+    script_printf 'EXPECTED_BUILD_STATE=%q\nEXPECTED_BUILD_ID=%q\n' \
+      "$build_state" "$build_identity" || script_write_failed=1
+    script_printf 'EXPECTED_TOKEN=%q\n' "$cleanup_token" || script_write_failed=1
     while IFS= read -r line; do
-      printf '%s\n' "$line"
+      script_printf '%s\n' "$line" || script_write_failed=1
     done <<'CLEANUP_BODY'
 
 die() {
@@ -1320,6 +1345,7 @@ if [[ "$stage" == systemd_reloaded ]]; then
   printf '首次安装入口与事务标记已安全清理；失败代码目录保留在 %s。\n' "$DEPLOY_ROOT"
 fi
 CLEANUP_BODY
+    (( script_write_failed == 0 ))
   } >"$FIRST_INSTALL_CLEANUP_SCRIPT_TEMP"; then
     cleanup_first_install_generation || true
     return 1
