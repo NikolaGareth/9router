@@ -186,6 +186,8 @@ if [[ -n "$INHERITED_LOCK_FD" ]]; then
   inherited_identity="$("$STAT" -Lc '%d:%i' -- "$inherited_fd_path")" ||
     die '无法读取继承锁 FD 标识'
   [[ "$lock_identity" == "$inherited_identity" ]] || die '继承锁 FD 与更新锁文件不一致'
+  [[ "$lock_identity" == "$("$STAT" -Lc '%d:%i' -- "$LOCK_FILE")" ]] ||
+    die '更新锁路径在继承 FD 校验期间发生变化'
   "$FLOCK" -n "$INHERITED_LOCK_FD" || { echo "继承的 9Router 更新锁无效" >&2; exit 1; }
 else
   exec 9>>"$LOCK_FILE"
@@ -202,7 +204,7 @@ write_phase() {
   local phase_parent="${PHASE_FILE%/*}"
 
   case "$next_phase" in
-    preparing|building|stopping|old_moved|new_moved|started|healthy|health_failed) ;;
+    preparing|building|stopping|old_move_intent|old_moved|new_move_intent|new_moved|started|healthy|health_failed) ;;
     *) die "拒绝写入未知更新阶段：$next_phase" ;;
   esac
   if [[ -e "$phase_parent" && ! -d "$phase_parent" ]]; then
@@ -272,8 +274,14 @@ report_failure() {
     stopping)
       printf '正在停止服务，尚未开始目录切换。\n' >&2
       ;;
+    old_move_intent)
+      printf '已记录移动旧目录的意图，但尚未提交 old_moved；必须核对 ROOT 与 previous 现场。\n' >&2
+      ;;
     old_moved)
       printf '旧版本已移至 previous，新版本尚未完全启动。\n' >&2
+      ;;
+    new_move_intent)
+      printf '已记录移动新目录的意图，但尚未提交 new_moved；必须核对 BUILD、ROOT 与 previous 现场。\n' >&2
       ;;
     new_moved)
       printf '正在将构建目录切换为正式目录，请依据下方目录状态恢复。\n' >&2
@@ -294,13 +302,10 @@ report_failure() {
       if [[ -e "$PREVIOUS_DIR" ]]; then
         if [[ -e "$ROOT" ]]; then
           printf '旧版本保留在 %q。\n' "$PREVIOUS_DIR" >&2
-          printf '人工恢复：systemctl stop 9router && rm -rf -- %q && mv -- %q %q && systemctl start 9router\n' \
-            "$ROOT" "$PREVIOUS_DIR" "$ROOT" >&2
         else
           printf '旧版本保留在 %q，正式目录当前不存在。\n' "$PREVIOUS_DIR" >&2
-          printf '人工恢复：mv -- %q %q && systemctl start 9router\n' \
-            "$PREVIOUS_DIR" "$ROOT" >&2
         fi
+        printf '未自动回滚，也未生成不持锁的内联恢复命令；请在共享更新锁保护下核对现场。\n' >&2
       else
         printf '未发现可恢复的旧版本目录，未生成恢复命令。\n' >&2
       fi
@@ -312,6 +317,15 @@ report_failure() {
       else
         printf '目录切换尚未发生，未生成恢复命令。\n' >&2
       fi
+      ;;
+  esac
+
+  case "$phase" in
+    old_move_intent|new_move_intent)
+      printf '意图阶段不代表移动已提交；未生成恢复命令。ROOT=%q（%s），BUILD=%q（%s），previous=%q（%s）。\n' \
+        "$ROOT" "$([[ -e "$ROOT" || -L "$ROOT" ]] && printf present || printf absent)" \
+        "$BUILD_DIR" "$([[ -e "$BUILD_DIR" || -L "$BUILD_DIR" ]] && printf present || printf absent)" \
+        "$PREVIOUS_DIR" "$([[ -e "$PREVIOUS_DIR" || -L "$PREVIOUS_DIR" ]] && printf present || printf absent)" >&2
       ;;
   esac
 
@@ -370,6 +384,8 @@ RUNTIME_DIR="$BUILD_DIR/.runtime"
 ensure_deployment_same_device
 
 if [[ -e "$ROOT" ]]; then
+  [[ -d "$ROOT" && ! -L "$ROOT" ]] ||
+    die "正式部署路径必须是非符号链接目录：$ROOT"
   had_existing_root=1
   write_phase stopping
   if ! "$SYSTEMCTL" stop 9router; then
@@ -381,19 +397,21 @@ if [[ -e "$ROOT" ]]; then
   if [[ -e "$PREVIOUS_DIR" || -L "$PREVIOUS_DIR" ]]; then
     die "切换前检测到 previous 目录，拒绝覆盖或嵌套旧版本"
   fi
-  write_phase old_moved
+  write_phase old_move_intent
   "$MV" -T -n -- "$ROOT" "$PREVIOUS_DIR"
-  if [[ -e "$ROOT" || -L "$ROOT" || ! -e "$PREVIOUS_DIR" ]]; then
+  if [[ -e "$ROOT" || -L "$ROOT" || ! -d "$PREVIOUS_DIR" || -L "$PREVIOUS_DIR" ]]; then
     die "旧版本目录移动未完成，拒绝继续切换"
   fi
+  write_phase old_moved
 fi
 
-write_phase new_moved
+write_phase new_move_intent
 "$MV" -T -n -- "$BUILD_DIR" "$ROOT"
-if [[ -e "$BUILD_DIR" || -L "$BUILD_DIR" || ! -e "$ROOT" ]]; then
+if [[ -e "$BUILD_DIR" || -L "$BUILD_DIR" || ! -d "$ROOT" || -L "$ROOT" ]]; then
   die "新版本目录移动未完成，拒绝继续启动"
 fi
 swapped=1
+write_phase new_moved
 "$SYSTEMCTL" start 9router
 write_phase started
 
