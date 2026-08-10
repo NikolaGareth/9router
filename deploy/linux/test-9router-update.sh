@@ -88,7 +88,30 @@ fi
 mkdir -p .next/standalone node_modules/node-forge node_modules/next src/mitm open-sse
 : >.next/standalone/server.js
 : >custom-server.js
-: >src/mitm/mitm-marker
+: >src/mitm/server.js
+EOF
+
+  cat >"$TMP/bin/node" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+if [[ "$1" == --check && "${NINEROUTER_TEST_NODE_CHECK_FAIL:-0}" == 1 ]]; then
+  exit 12
+fi
+exit 0
+EOF
+
+  cat >"$TMP/bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+while [[ "$1" == -T || "$1" == -n || "$1" == -- ]]; do
+  shift
+done
+source_path="$1"
+destination_path="$2"
+if [[ -e "$destination_path" || -L "$destination_path" ]]; then
+  exit 1
+fi
+/bin/mv "$source_path" "$destination_path"
 EOF
 
   cat >"$TMP/bin/systemctl" <<'EOF'
@@ -104,6 +127,10 @@ case "$1" in
     else
       printf 'inactive\n' >"$NINEROUTER_TEST_SYSTEMCTL_STATE"
     fi
+    if [[ "${NINEROUTER_TEST_CREATE_PREVIOUS_ON_STOP:-0}" == 1 ]]; then
+      mkdir -p "$NINEROUTER_TEST_PREVIOUS_DIR"
+      : >"$NINEROUTER_TEST_PREVIOUS_DIR/race-marker"
+    fi
     ;;
   start)
     [[ "$2" == 9router ]]
@@ -117,9 +144,21 @@ case "$1" in
     fi
     ;;
   is-active)
-    [[ "$2" == --quiet && "$3" == 9router ]]
-    [[ "$(cat "$NINEROUTER_TEST_SYSTEMCTL_STATE")" == active ]] && exit 0
-    exit 3
+    if [[ "$2" == --quiet && "$3" == 9router ]]; then
+      [[ "$(cat "$NINEROUTER_TEST_SYSTEMCTL_STATE")" == active ]] && exit 0
+      exit 3
+    fi
+    [[ "$2" == 9router ]]
+    if [[ "${NINEROUTER_TEST_STOP_QUERY_ERROR:-0}" == 1 ]]; then
+      printf 'Failed to connect to bus\n'
+      exit 1
+    fi
+    case "$(cat "$NINEROUTER_TEST_SYSTEMCTL_STATE")" in
+      active) printf 'active\n'; exit 0 ;;
+      inactive) printf 'inactive\n'; exit 3 ;;
+      failed) printf 'failed\n'; exit 3 ;;
+      *) printf 'unknown\n'; exit 4 ;;
+    esac
     ;;
   *)
     echo "unexpected systemctl command: $*" >&2
@@ -149,8 +188,8 @@ EOF
 exit 0
 EOF
 
-  chmod +x "$TMP/bin/git" "$TMP/bin/flock" "$TMP/bin/npm" \
-    "$TMP/bin/systemctl" "$TMP/bin/curl" "$TMP/bin/sleep"
+  chmod +x "$TMP/bin/git" "$TMP/bin/flock" "$TMP/bin/npm" "$TMP/bin/node" \
+    "$TMP/bin/mv" "$TMP/bin/systemctl" "$TMP/bin/curl" "$TMP/bin/sleep"
 }
 
 run_updater() {
@@ -162,12 +201,14 @@ run_updater() {
     NINEROUTER_PREVIOUS_DIR="$TMP/opt/9router.previous" \
     NINEROUTER_LOCK_FILE="$TMP/run/9router-update.lock" \
     NINEROUTER_GIT="$TMP/bin/git" \
+    NINEROUTER_MV="$TMP/bin/mv" \
     NINEROUTER_NPM="$TMP/bin/npm" \
     NINEROUTER_SYSTEMCTL="$TMP/bin/systemctl" \
     NINEROUTER_CURL="$TMP/bin/curl" \
-    NINEROUTER_NODE="$(command -v node)" \
+    NINEROUTER_NODE="$TMP/bin/node" \
     NINEROUTER_TEST_SYSTEMCTL_LOG="$TMP/systemctl.log" \
     NINEROUTER_TEST_SYSTEMCTL_STATE="$TMP/systemctl.state" \
+    NINEROUTER_TEST_PREVIOUS_DIR="$TMP/opt/9router.previous" \
     NINEROUTER_TEST_NPM_LOG="$TMP/npm.log" \
     NINEROUTER_TEST_CURL_LOG="$TMP/curl.log" \
     NINEROUTER_TEST_GIT_LOG="$TMP/git.log" \
@@ -189,7 +230,7 @@ test_successful_update_installs_flat_runtime_and_restarts_service() {
   assert_file "$TMP/opt/9router/.runtime/server.js"
   assert_dir "$TMP/opt/9router/.runtime/open-sse"
   assert_dir "$TMP/opt/9router/.runtime/src/mitm"
-  assert_file "$TMP/opt/9router/.runtime/src/mitm/mitm-marker"
+  assert_file "$TMP/opt/9router/.runtime/src/mitm/server.js"
   assert_not_exists "$TMP/opt/9router/.runtime/src/mitm/mitm"
   assert_not_exists "$TMP/opt/9router.previous"
   grep -q '^npm ci$' "$TMP/npm.log" || fail 'dependencies were not installed with npm ci'
@@ -229,6 +270,33 @@ test_rejects_unsafe_data_overlapping_and_symlink_paths() {
   TMP=""
 }
 
+test_rejects_unsafe_or_overlapping_lock_before_opening_it() {
+  new_tmp
+  make_fakes
+  printf 'lock-sentinel\n' >"$TMP/run/9router-update.lock"
+  if run_updater "$TMP/output-overlap" env \
+    "NINEROUTER_ROOT=$TMP/run" \
+    "NINEROUTER_BUILD_DIR=$TMP/opt/9router-build" \
+    "NINEROUTER_PREVIOUS_DIR=$TMP/opt/9router.previous" \
+    "NINEROUTER_LOCK_FILE=$TMP/run/9router-update.lock"; then
+    fail 'lock file overlapping root was accepted'
+  fi
+  grep -Fqx 'lock-sentinel' "$TMP/run/9router-update.lock" || \
+    fail 'unsafe lock was truncated before validation'
+
+  cleanup
+  TMP=""
+  new_tmp
+  make_fakes
+  : >"$TMP/run/real.lock"
+  ln -s "$TMP/run/real.lock" "$TMP/run/lock-link"
+  if run_updater "$TMP/output-symlink" env "NINEROUTER_LOCK_FILE=$TMP/run/lock-link"; then
+    fail 'symlink lock file was accepted'
+  fi
+  cleanup
+  TMP=""
+}
+
 test_existing_previous_refuses_update_without_deletion() {
   new_tmp
   make_fakes
@@ -262,6 +330,52 @@ test_stop_failure_and_active_service_abort_before_switch() {
   fi
   assert_file "$TMP/opt/9router/current-marker"
   assert_not_exists "$TMP/opt/9router.previous"
+  if run_updater "$TMP/output-query-error" env NINEROUTER_TEST_STOP_QUERY_ERROR=1; then
+    fail 'updater continued after a failed stop-state query'
+  fi
+  assert_file "$TMP/opt/9router/current-marker"
+  assert_not_exists "$TMP/opt/9router.previous"
+  cleanup
+  TMP=""
+}
+
+test_build_and_node_check_failures_do_not_stop_service() {
+  new_tmp
+  make_fakes
+  mkdir -p "$TMP/opt/9router"
+  : >"$TMP/opt/9router/current-marker"
+  if run_updater "$TMP/output-build" env NINEROUTER_TEST_BUILD_FAIL=1; then
+    fail 'updater continued after build failure'
+  fi
+  assert_file "$TMP/opt/9router/current-marker"
+  assert_empty_file "$TMP/systemctl.log"
+
+  cleanup
+  TMP=""
+  new_tmp
+  make_fakes
+  mkdir -p "$TMP/opt/9router"
+  : >"$TMP/opt/9router/current-marker"
+  if run_updater "$TMP/output-node" env NINEROUTER_TEST_NODE_CHECK_FAIL=1; then
+    fail 'updater continued after Node syntax-check failure'
+  fi
+  assert_file "$TMP/opt/9router/current-marker"
+  assert_empty_file "$TMP/systemctl.log"
+  cleanup
+  TMP=""
+}
+
+test_previous_recheck_prevents_racy_nested_move() {
+  new_tmp
+  make_fakes
+  mkdir -p "$TMP/opt/9router"
+  : >"$TMP/opt/9router/current-marker"
+  if run_updater "$TMP/output" env NINEROUTER_TEST_CREATE_PREVIOUS_ON_STOP=1; then
+    fail 'updater switched despite a newly-created previous directory'
+  fi
+  assert_file "$TMP/opt/9router/current-marker"
+  assert_file "$TMP/opt/9router.previous/race-marker"
+  assert_not_exists "$TMP/opt/9router.previous/9router/current-marker"
   cleanup
   TMP=""
 }
@@ -353,6 +467,8 @@ test_health_rejects_inactive_service_and_trap_preserves_recovery_state() {
   fi
   assert_file "$TMP/opt/9router.previous/current-marker"
   assert_dir "$TMP/opt/9router"
+  grep -Fq '阶段：starting-new-in-progress' "$TMP/output-term" || \
+    fail 'trap did not retain the pre-start in-progress phase'
   grep -Fq '新版本已位于正式目录' "$TMP/output-term" || \
     fail 'trap did not report the actual post-switch state'
   grep -Fq '人工恢复：' "$TMP/output-term" || \
@@ -367,8 +483,11 @@ fi
 
 test_successful_update_installs_flat_runtime_and_restarts_service
 test_rejects_unsafe_data_overlapping_and_symlink_paths
+test_rejects_unsafe_or_overlapping_lock_before_opening_it
 test_existing_previous_refuses_update_without_deletion
 test_stop_failure_and_active_service_abort_before_switch
+test_build_and_node_check_failures_do_not_stop_service
+test_previous_recheck_prevents_racy_nested_move
 test_lock_contention_prevents_mutation
 test_health_failure_preserves_previous_release_and_reports_safe_recovery
 test_first_install_health_failure_has_no_invalid_recovery_instruction
