@@ -20,6 +20,7 @@ if [[ "$EUID" -eq 0 && "${NINEROUTER_TEST_MODE:-0}" == 1 ]]; then
   PHASE_FILE="$NINEROUTER_PHASE_FILE"
   GIT="$NINEROUTER_GIT"
   NPM="$NINEROUTER_NPM"
+  NPM_CLI="$NINEROUTER_NPM"
   NODE="$NINEROUTER_NODE"
   SYSTEMCTL="$NINEROUTER_SYSTEMCTL"
   CURL="$NINEROUTER_CURL"
@@ -45,6 +46,7 @@ elif [[ "$EUID" -eq 0 ]]; then
   PHASE_FILE=/run/9router-update.phase
   GIT=/usr/bin/git
   NPM=/opt/node-v24.15.0-npm/node/bin/npm
+  NPM_CLI=/opt/node-v24.15.0-npm/node/lib/node_modules/npm/bin/npm-cli.js
   NODE=/opt/node-v24.15.0-npm/node/bin/node
   SYSTEMCTL=/usr/bin/systemctl
   CURL=/usr/bin/curl
@@ -63,6 +65,7 @@ else
   PHASE_FILE="${NINEROUTER_PHASE_FILE:-/run/9router-update.phase}"
   GIT="${NINEROUTER_GIT:-/usr/bin/git}"
   NPM="${NINEROUTER_NPM:-/opt/node-v24.15.0-npm/node/bin/npm}"
+  NPM_CLI="${NINEROUTER_NPM_CLI:-$NPM}"
   NODE="${NINEROUTER_NODE:-/opt/node-v24.15.0-npm/node/bin/node}"
   SYSTEMCTL="${NINEROUTER_SYSTEMCTL:-/usr/bin/systemctl}"
   CURL="${NINEROUTER_CURL:-/usr/bin/curl}"
@@ -146,6 +149,7 @@ validate_root_test_mode() {
 ROOT="$(normalize_path ROOT "$ROOT")"
 BUILD_DIR="$(normalize_path BUILD_DIR "$BUILD_DIR")"
 PREVIOUS_DIR="$(normalize_path PREVIOUS_DIR "$PREVIOUS_DIR")"
+RETIRED_DIR="$(normalize_path RETIRED_DIR "${PREVIOUS_DIR}.retired")"
 LOCK_FILE="$(normalize_path LOCK_FILE "$LOCK_FILE")"
 PHASE_FILE="$(normalize_path PHASE_FILE "$PHASE_FILE")"
 if paths_overlap "$ROOT" "$BUILD_DIR" ||
@@ -204,7 +208,7 @@ write_phase() {
   local phase_parent="${PHASE_FILE%/*}"
 
   case "$next_phase" in
-    preparing|building|stopping|old_move_intent|old_moved|new_move_intent|new_moved|started|healthy|health_failed) ;;
+    preparing|building|stopping|old_move_intent|old_moved|new_move_intent|new_moved|started|healthy|health_failed|previous_cleanup_intent|previous_retired) ;;
     *) die "拒绝写入未知更新阶段：$next_phase" ;;
   esac
   if [[ -e "$phase_parent" && ! -d "$phase_parent" ]]; then
@@ -289,7 +293,7 @@ report_failure() {
     started|health_failed)
       printf '新版本已位于正式目录，服务启动或健康检查未完成。\n' >&2
       ;;
-    healthy)
+    healthy|previous_cleanup_intent|previous_retired)
       printf '新版本已通过健康检查，但后续收尾失败。\n' >&2
       ;;
   esac
@@ -352,6 +356,33 @@ trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+if [[ "${1:-}" == --recover ]]; then
+  [[ -f "$PHASE_FILE" && ! -L "$PHASE_FILE" ]] || die '没有可恢复的更新阶段'
+  recovery_phase="$(<"$PHASE_FILE")"
+  case "$recovery_phase" in old_moved|new_moved|started|health_failed) ;; *) die "当前阶段不可恢复：$recovery_phase" ;; esac
+  [[ -d "$PREVIOUS_DIR" && ! -L "$PREVIOUS_DIR" && -d "$ROOT" && ! -L "$ROOT" ]] || die '恢复现场不完整，拒绝操作'
+  "$SYSTEMCTL" stop 9router
+  service_is_explicitly_stopped || die '服务未停止，拒绝恢复'
+  [[ ! -e "$RETIRED_DIR" && ! -L "$RETIRED_DIR" ]] || die 'retired 路径已存在，拒绝恢复'
+  "$MV" -T -n -- "$ROOT" "$RETIRED_DIR"
+  "$MV" -T -n -- "$PREVIOUS_DIR" "$ROOT"
+  "$SYSTEMCTL" start 9router
+  "$SYSTEMCTL" is-active --quiet 9router || die '旧版本恢复后未启动'
+  "$RM" -rf -- "$RETIRED_DIR"
+  "$RM" -f -- "$PHASE_FILE"
+  printf '9Router 已按显式 --recover 请求恢复旧版本。\n'
+  exit 0
+fi
+
+if [[ -e "$RETIRED_DIR" || -L "$RETIRED_DIR" ]]; then
+  [[ -d "$RETIRED_DIR" && ! -L "$RETIRED_DIR" ]] || die 'retired 路径不安全'
+  [[ -f "$PHASE_FILE" && ! -L "$PHASE_FILE" ]] || die 'retired 存在但缺少可信阶段文件'
+  cleanup_phase="$(<"$PHASE_FILE")"
+  case "$cleanup_phase" in previous_cleanup_intent|previous_retired) ;; *) die "retired 与阶段不匹配：$cleanup_phase" ;; esac
+  "$RM" -rf -- "$RETIRED_DIR"
+  write_phase healthy
+fi
+
 write_phase preparing
 if [[ -e "$PREVIOUS_DIR" || -L "$PREVIOUS_DIR" ]]; then
   die "检测到已有旧版本目录，拒绝更新以保留人工恢复状态：$PREVIOUS_DIR"
@@ -362,8 +393,8 @@ write_phase building
 "$GIT" clone --depth 1 --branch "$BRANCH" "$REPOSITORY" "$BUILD_DIR"
 (
   cd "$BUILD_DIR"
-  NEXT_TELEMETRY_DISABLED=1 "$NPM" ci
-  NEXT_TELEMETRY_DISABLED=1 "$NPM" run build
+  PATH="${NODE%/*}:/usr/bin:/bin" NEXT_TELEMETRY_DISABLED=1 "$NODE" "$NPM_CLI" ci
+  PATH="${NODE%/*}:/usr/bin:/bin" NEXT_TELEMETRY_DISABLED=1 "$NODE" "$NPM_CLI" run build
 )
 test -f "$BUILD_DIR/.next/standalone/server.js"
 test -f "$BUILD_DIR/custom-server.js"
@@ -375,25 +406,35 @@ RUNTIME_DIR="$BUILD_DIR/.runtime"
 "$CP" -a "$BUILD_DIR/open-sse/." "$RUNTIME_DIR/open-sse/"
 "$MKDIR" -p "$RUNTIME_DIR/src/mitm"
 "$CP" -a "$BUILD_DIR/src/mitm/." "$RUNTIME_DIR/src/mitm/"
+"$MKDIR" -p "$RUNTIME_DIR/src/shared/constants"
+"$CP" "$BUILD_DIR/src/shared/constants/mitmToolHosts.js" "$RUNTIME_DIR/src/shared/constants/mitmToolHosts.js"
 "$MKDIR" -p "$RUNTIME_DIR/node_modules/node-forge" "$RUNTIME_DIR/node_modules/next"
 "$CP" -a "$BUILD_DIR/node_modules/node-forge/." "$RUNTIME_DIR/node_modules/node-forge/"
 "$CP" -a "$BUILD_DIR/node_modules/next/." "$RUNTIME_DIR/node_modules/next/"
 "$NODE" --check "$RUNTIME_DIR/custom-server.js"
 "$NODE" --check "$RUNTIME_DIR/server.js"
+(
+  cd "$RUNTIME_DIR"
+  "$NODE" -e "require('./src/mitm/dns/dnsConfig.js')"
+)
 
 ensure_deployment_same_device
+
+service_was_active=0
+if "$SYSTEMCTL" is-active --quiet 9router; then
+  service_was_active=1
+  write_phase stopping
+  "$SYSTEMCTL" stop 9router || die "停止 9Router 服务失败，拒绝切换目录"
+  service_is_explicitly_stopped || die "9Router 服务未明确处于 inactive 或 failed 状态，拒绝切换目录"
+else
+  active_query_status=$?
+  case "$active_query_status" in 3|4) ;; *) die '无法确认 9Router 运行状态，拒绝切换目录' ;; esac
+fi
 
 if [[ -e "$ROOT" ]]; then
   [[ -d "$ROOT" && ! -L "$ROOT" ]] ||
     die "正式部署路径必须是非符号链接目录：$ROOT"
   had_existing_root=1
-  write_phase stopping
-  if ! "$SYSTEMCTL" stop 9router; then
-    die "停止 9Router 服务失败，拒绝切换目录"
-  fi
-  if ! service_is_explicitly_stopped; then
-    die "9Router 服务未明确处于 inactive 或 failed 状态，拒绝切换目录"
-  fi
   if [[ -e "$PREVIOUS_DIR" || -L "$PREVIOUS_DIR" ]]; then
     die "切换前检测到 previous 目录，拒绝覆盖或嵌套旧版本"
   fi
@@ -418,7 +459,7 @@ write_phase started
 healthy=0
 for _ in {1..30}; do
   if "$SYSTEMCTL" is-active --quiet 9router; then
-    health_response="$("$CURL" -sS --connect-timeout 2 --max-time 3 \
+    health_response="$("$CURL" --noproxy '*' -sS --connect-timeout 2 --max-time 3 \
       -o /dev/null -w '%{http_code} %{redirect_url}' "$HEALTH_URL")" || health_response=""
     http_status="${health_response%% *}"
     redirect_target="${health_response#* }"
@@ -448,6 +489,11 @@ fi
 revision="$("$GIT" -C "$ROOT" rev-parse --short HEAD)"
 write_phase healthy
 if [[ "$had_existing_root" -eq 1 ]]; then
-  "$RM" -rf -- "$PREVIOUS_DIR"
+  write_phase previous_cleanup_intent
+  "$MV" -T -n -- "$PREVIOUS_DIR" "$RETIRED_DIR"
+  [[ ! -e "$PREVIOUS_DIR" && -d "$RETIRED_DIR" && ! -L "$RETIRED_DIR" ]] || die 'previous 退役切换未完成'
+  write_phase previous_retired
+  "$RM" -rf -- "$RETIRED_DIR"
+  write_phase healthy
 fi
 printf '9Router 更新成功，版本：%s\n' "$revision"

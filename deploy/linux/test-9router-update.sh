@@ -73,6 +73,8 @@ test_service_unit_uses_fixed_production_paths_without_credentials() {
     fail 'service unit does not use the fixed production Node entry point'
   grep -q '^Environment=DATA_DIR=/root/.9router$' "$SERVICE_UNIT" || \
     fail 'service unit does not use the fixed production data directory'
+  grep -q '^EnvironmentFile=/etc/9router/9router.env$' "$SERVICE_UNIT" || \
+    fail 'service unit does not require the root-only external environment file'
   if grep -Eqi 'password|api[_-]?key|token|secret' "$SERVICE_UNIT"; then
     fail 'service unit must not contain credentials'
   fi
@@ -91,7 +93,7 @@ test_installer_has_root_guard_and_preserves_data_directory() {
 
 make_fakes() {
   mkdir -p "$TMP/bin" "$TMP/opt" "$TMP/run" "$TMP/usr/local/sbin" \
-    "$TMP/etc/systemd/system" "$TMP/root"
+    "$TMP/etc/systemd/system" "$TMP/etc/9router" "$TMP/root"
   : >"$TMP/systemctl.log"
   : >"$TMP/npm.log"
   : >"$TMP/curl.log"
@@ -171,12 +173,13 @@ if [[ "${NINEROUTER_TEST_BUILD_FAIL:-0}" == 1 ]]; then
   exit 42
 fi
 mkdir -p .next/standalone/src/mitm .next/standalone/open-sse \
-  node_modules/node-forge node_modules/next src/mitm open-sse
+  node_modules/node-forge node_modules/next src/mitm src/shared/constants open-sse
 : >.next/standalone/server.js
 : >.next/standalone/src/mitm/server.js
 : >.next/standalone/open-sse/standalone-marker
 : >custom-server.js
 : >src/mitm/runtime-helper.js
+: >src/shared/constants/mitmToolHosts.js
 : >open-sse/source-marker
 EOF
 
@@ -221,9 +224,13 @@ fi
 exec /usr/bin/stat -f "$format" "$path"
 EOF
 
-  cat >"$TMP/bin/node" <<'EOF'
+cat >"$TMP/bin/node" <<'EOF'
 #!/usr/bin/env bash
 set -eu
+if [[ "${1:-}" == */npm || "${1:-}" == */npm-cli.js ]]; then
+  shift
+  exec "$NINEROUTER_NPM" "$@"
+fi
 if [[ "$1" == --check && "${NINEROUTER_TEST_NODE_CHECK_FAIL:-0}" == 1 ]]; then
   exit 12
 fi
@@ -383,7 +390,7 @@ EOF
   cat >"$TMP/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 set -eu
-printf 'curl health-check\n' >>"$NINEROUTER_TEST_CURL_LOG"
+printf 'curl %s\n' "$*" >>"$NINEROUTER_TEST_CURL_LOG"
 case "${NINEROUTER_TEST_CURL_MODE:-success}" in
   success) printf '200 \n' ;;
   login-redirect) printf '302 http://127.0.0.1/login\n' ;;
@@ -624,6 +631,7 @@ run_installer() {
     NINEROUTER_UPDATER_TARGET="$TMP/usr/local/sbin/9router-update" \
     NINEROUTER_SERVICE_TARGET="$TMP/etc/systemd/system/9router.service" \
     NINEROUTER_DATA_DIR="$TMP/root/.9router" \
+    NINEROUTER_ENV_FILE="$TMP/etc/9router/9router.env" \
     NINEROUTER_SYSTEMCTL="$TMP/bin/systemctl" \
     NINEROUTER_NODE="$TMP/bin/node" \
     NINEROUTER_NPM="$TMP/bin/npm" \
@@ -808,6 +816,13 @@ test_installer_uses_only_test_paths_and_preserves_existing_data() {
   assert_file "$TMP/root/.9router/existing-data"
   grep -Fqx 'keep-this-data' "$TMP/root/.9router/existing-data" ||
     fail 'installer changed existing data-directory content'
+  assert_file "$TMP/etc/9router/9router.env"
+  [[ "$(file_mode "$TMP/etc/9router/9router.env")" == 600 ]] ||
+    fail 'generated environment file is not mode 0600'
+  grep -Eq '^INITIAL_PASSWORD=[0-9a-f]{64}$' "$TMP/etc/9router/9router.env" ||
+    fail 'installer did not generate a strong initial password'
+  generated_password="$(sed -n 's/^INITIAL_PASSWORD=//p' "$TMP/etc/9router/9router.env")"
+  ! grep -Fq "$generated_password" "$TMP/output" || fail 'installer echoed the generated password'
   ! compgen -G "$TMP/etc/systemd/system/9router.service.backup.*" >/dev/null ||
     fail 'installer did not clean its unit backup after success'
   assert_event_log \
@@ -820,6 +835,9 @@ test_installer_uses_only_test_paths_and_preserves_existing_data() {
     'systemctl daemon-reload' \
     'systemctl enable 9router' \
     'git clone' \
+    'systemctl is-active --quiet 9router' \
+    'systemctl stop 9router' \
+    'systemctl is-active 9router' \
     'systemctl start 9router' \
     'systemctl is-active --quiet 9router' \
     'rm cleanup-backup'
@@ -985,7 +1003,7 @@ test_updater_writes_atomic_phase_protocol() {
   fi
   [[ "$(<"$TMP/phase.log")" == "$(printf '%s\n' \
     preparing building stopping old_move_intent old_moved \
-    new_move_intent new_moved started healthy)" ]] || \
+    new_move_intent new_moved started healthy previous_cleanup_intent previous_retired healthy)" ]] || \
     fail 'updater did not atomically record every success phase in order'
   grep -Fqx 'healthy' "$TMP/run/9router-update.phase" || \
     fail 'updater did not retain the final healthy phase'
@@ -1817,6 +1835,8 @@ test_successful_update_installs_flat_runtime_and_restarts_service() {
   grep -Fqx 'lock-sentinel' "$TMP/run/9router-update.lock" || \
     fail 'existing lock file was truncated'
   grep -q '^npm ci$' "$TMP/npm.log" || fail 'dependencies were not installed with npm ci'
+  grep -q -- "--noproxy \*" "$TMP/curl.log" || fail 'health check did not bypass ambient proxies'
+  assert_file "$TMP/opt/9router/.runtime/src/shared/constants/mitmToolHosts.js"
   grep -q '^stop 9router$' "$TMP/systemctl.log" || fail 'service was not stopped'
   grep -q '^is-active --quiet 9router$' "$TMP/systemctl.log" || fail 'service activity was not checked'
   grep -q '^start 9router$' "$TMP/systemctl.log" || fail 'service was not started'

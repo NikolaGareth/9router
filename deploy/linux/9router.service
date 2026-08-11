@@ -12,6 +12,7 @@ Environment=HOSTNAME=0.0.0.0
 Environment=PORT=80
 Environment=DATA_DIR=/root/.9router
 Environment=NEXT_TELEMETRY_DISABLED=1
+EnvironmentFile=/etc/9router/9router.env
 ExecStart=/opt/node-v24.15.0-npm/node/bin/node /opt/9router/.runtime/custom-server.js
 Restart=on-failure
 RestartSec=3

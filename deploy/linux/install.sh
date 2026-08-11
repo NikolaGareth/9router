@@ -33,6 +33,7 @@ UPDATER_STARTED=0
 UPDATER_PHASE="missing"
 DEPLOY_ROOT_EXISTED=0
 DEPLOY_ROOT_INITIAL_ID=""
+ENV_FILE_CREATED=0
 
 die() {
   printf '%s\n' "$*" >&2
@@ -145,6 +146,57 @@ updater_material_is_safe() {
 
 updater_recovery_is_safe() {
   updater_material_is_safe "$RECOVERY_UPDATER"
+}
+
+existing_entry_is_private() {
+  local path="$1"
+  local owner mode
+  if [[ "$TEST_MODE" == 1 ]]; then
+    owner="$(/usr/bin/stat -f %u "$path")" || return 1
+    mode="$(/usr/bin/stat -f %Lp "$path")" || return 1
+    [[ "$owner" == "$EUID" ]] || return 1
+  else
+    owner="$("$STAT" -c %u -- "$path")" || return 1
+    mode="$("$STAT" -c %a -- "$path")" || return 1
+    [[ "$owner" == 0 ]] || return 1
+  fi
+  (( (8#$mode & 022) == 0 ))
+}
+
+validate_or_create_env_file() {
+  local owner mode password api_secret salt env_temp
+  if [[ -e "$ENV_FILE" || -L "$ENV_FILE" ]]; then
+    [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] || die "环境文件必须是普通文件：$ENV_FILE"
+    if [[ "$TEST_MODE" == 1 ]]; then
+      owner="$(/usr/bin/stat -f %u "$ENV_FILE")" || die '无法读取环境文件 owner'
+      mode="$(/usr/bin/stat -f %Lp "$ENV_FILE")" || die '无法读取环境文件权限'
+      [[ "$owner" == "$EUID" ]] || die "测试环境文件 owner 不匹配：$ENV_FILE"
+    else
+      owner="$("$STAT" -c %u -- "$ENV_FILE")" || die '无法读取环境文件 owner'
+      mode="$("$STAT" -c %a -- "$ENV_FILE")" || die '无法读取环境文件权限'
+      [[ "$owner" == 0 ]] || die "环境文件必须属于 root：$ENV_FILE"
+    fi
+    (( (8#$mode & 077) == 0 )) ||
+      die "环境文件必须属于 root 且权限为 0600 或更严：$ENV_FILE"
+    return 0
+  fi
+
+  "$MKDIR" -p "${ENV_FILE%/*}"
+  chmod 0700 "${ENV_FILE%/*}"
+  password="$(/usr/bin/od -An -N32 -tx1 /dev/urandom | /usr/bin/tr -d ' \n')"
+  api_secret="$(/usr/bin/od -An -N32 -tx1 /dev/urandom | /usr/bin/tr -d ' \n')"
+  salt="$(/usr/bin/od -An -N32 -tx1 /dev/urandom | /usr/bin/tr -d ' \n')"
+  [[ ${#password} -eq 64 && ${#api_secret} -eq 64 && ${#salt} -eq 64 ]] || die '安全随机数生成失败'
+  env_temp="$(/usr/bin/mktemp "${ENV_FILE}.tmp.XXXXXX")"
+  if ! printf 'INITIAL_PASSWORD=%s\nAPI_KEY_SECRET=%s\nMACHINE_ID_SALT=%s\nBASE_URL=http://127.0.0.1\nNEXT_PUBLIC_BASE_URL=http://127.0.0.1\n' \
+    "$password" "$api_secret" "$salt" >"$env_temp"; then
+    cleanup_path "$env_temp" || true
+    die '环境文件写入失败'
+  fi
+  chmod 0600 "$env_temp" || { cleanup_path "$env_temp" || true; die '环境文件权限设置失败'; }
+  "$MV" -fT -- "$env_temp" "$ENV_FILE"
+  ENV_FILE_CREATED=1
+  printf '已生成 root-only 环境文件：%s；安装器不会回显密码，请安全保存并在首次登录后改密。\n' "$ENV_FILE"
 }
 
 restore_enable_state() {
@@ -1441,7 +1493,7 @@ if [[ "$TEST_MODE" == 1 ]]; then
 
   for override in UPDATER_TARGET SERVICE_TARGET DATA_DIR ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE PHASE_FILE RECOVERY_UNIT \
     RECOVERY_UPDATER RECOVERY_ENABLE_STATE RECOVERY_SCRIPT FIRST_INSTALL_CLEANUP_SCRIPT \
-    SYSTEMCTL NODE NPM GIT CURL FLOCK STAT MKDIR CP MV RM INSTALL; do
+    ENV_FILE SYSTEMCTL NODE NPM GIT CURL FLOCK STAT MKDIR CP MV RM INSTALL; do
     env_name="NINEROUTER_${override}"
     [[ -n "${!env_name+x}" ]] || die "root 测试模式缺少 $env_name"
   done
@@ -1452,6 +1504,7 @@ if [[ "$TEST_MODE" == 1 ]]; then
   PREVIOUS_DIR="$NINEROUTER_PREVIOUS_DIR"
   SERVICE_TARGET="$NINEROUTER_SERVICE_TARGET"
   DATA_DIR="$NINEROUTER_DATA_DIR"
+  ENV_FILE="$NINEROUTER_ENV_FILE"
   LOCK_FILE="$NINEROUTER_LOCK_FILE"
   PHASE_FILE="$NINEROUTER_PHASE_FILE"
   RECOVERY_UNIT="$NINEROUTER_RECOVERY_UNIT"
@@ -1472,7 +1525,7 @@ if [[ "$TEST_MODE" == 1 ]]; then
   RM="$NINEROUTER_RM"
   INSTALL="$NINEROUTER_INSTALL"
 
-  for target in DATA_DIR LOCK_FILE PHASE_FILE RECOVERY_UNIT \
+  for target in DATA_DIR ENV_FILE LOCK_FILE PHASE_FILE RECOVERY_UNIT \
     RECOVERY_UPDATER RECOVERY_ENABLE_STATE RECOVERY_SCRIPT FIRST_INSTALL_CLEANUP_SCRIPT \
     SYSTEMCTL NODE NPM GIT CURL FLOCK STAT MKDIR CP MV RM INSTALL; do
     validate_test_path "$target" "${!target}"
@@ -1484,7 +1537,7 @@ if [[ "$TEST_MODE" == 1 ]]; then
   validate_test_path PREVIOUS_DIR "$PREVIOUS_DIR"
 else
   for override in NINEROUTER_TEST_MODE NINEROUTER_TEST_ROOT NINEROUTER_UPDATER_TARGET \
-    NINEROUTER_SERVICE_TARGET NINEROUTER_DATA_DIR NINEROUTER_LOCK_FILE NINEROUTER_PHASE_FILE \
+    NINEROUTER_SERVICE_TARGET NINEROUTER_DATA_DIR NINEROUTER_ENV_FILE NINEROUTER_LOCK_FILE NINEROUTER_PHASE_FILE \
     NINEROUTER_ROOT NINEROUTER_BUILD_DIR NINEROUTER_PREVIOUS_DIR \
     NINEROUTER_RECOVERY_UNIT NINEROUTER_RECOVERY_UPDATER NINEROUTER_RECOVERY_ENABLE_STATE \
     NINEROUTER_RECOVERY_SCRIPT NINEROUTER_FIRST_INSTALL_CLEANUP_SCRIPT \
@@ -1500,6 +1553,7 @@ else
   PREVIOUS_DIR=/opt/9router.previous
   SERVICE_TARGET=/etc/systemd/system/9router.service
   DATA_DIR=/root/.9router
+  ENV_FILE=/etc/9router/9router.env
   LOCK_FILE=/run/9router-update.lock
   PHASE_FILE=/run/9router-update.phase
   RECOVERY_UNIT=/run/9router-install-recovery.unit
@@ -1556,6 +1610,17 @@ exec 8>>"$LOCK_FILE"
 validate_protocol_paths
 path_is_absent "$FAILED_ROOT" ||
   die "检测到失败代码检查目录，拒绝改写安装入口；请先检查并移走或清理：$FAILED_ROOT"
+
+if [[ -f "$SERVICE_TARGET" && ! -L "$SERVICE_TARGET" ]]; then
+  existing_entry_is_private "$SERVICE_TARGET" || die '原有 systemd unit 非 root 所有或可被组/其他用户写入，拒绝安装'
+  if /usr/bin/grep -Eq '^Environment=.*(INITIAL_PASSWORD|API_KEY_SECRET|MACHINE_ID_SALT|JWT_SECRET)=' "$SERVICE_TARGET"; then
+    die "原有 unit 含内联秘密，拒绝覆盖；请先将秘密迁移到 $ENV_FILE（root:root，0600）并删除内联 Environment"
+  fi
+fi
+if [[ -f "$UPDATER_TARGET" && ! -L "$UPDATER_TARGET" ]]; then
+  existing_entry_is_private "$UPDATER_TARGET" || die '原有 updater 非 root 所有或可被组/其他用户写入，拒绝安装'
+fi
+validate_or_create_env_file
 
 if ENABLE_STATE="$($SYSTEMCTL is-enabled 9router 2>/dev/null)"; then
   ENABLE_QUERY_STATUS=0
@@ -1642,15 +1707,15 @@ fi
 
 UPDATER_STAGED="$(/usr/bin/mktemp "${UPDATER_TARGET}.new.XXXXXX")"
 "$INSTALL" -m 0755 "$SCRIPT_DIR/9router-update" "$UPDATER_STAGED"
+UPDATER_DEPLOYED=1
 "$MV" -fT -- "$UPDATER_STAGED" "$UPDATER_TARGET"
 UPDATER_STAGED=""
-UPDATER_DEPLOYED=1
 
 UNIT_STAGED="$(/usr/bin/mktemp "${SERVICE_TARGET}.new.XXXXXX")"
 "$INSTALL" -m 0644 "$SCRIPT_DIR/9router.service" "$UNIT_STAGED"
+UNIT_DEPLOYED=1
 "$MV" -fT -- "$UNIT_STAGED" "$SERVICE_TARGET"
 UNIT_STAGED=""
-UNIT_DEPLOYED=1
 
 "$MKDIR" -p "$DATA_DIR"
 "$SYSTEMCTL" daemon-reload

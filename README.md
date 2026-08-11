@@ -97,10 +97,12 @@ Cursor、Cline、Continue、Roo Code 等客户端均可使用此配置。
 先将仓库克隆到临时管理目录，再从仓库根目录执行首次安装：
 
 ```bash
-git clone https://github.com/NikolaGareth/9router.git /tmp/9router-admin
+git clone --branch master --depth 1 https://github.com/NikolaGareth/9router.git /tmp/9router-admin
 cd /tmp/9router-admin
 sudo bash deploy/linux/install.sh
 ```
+
+首次安装会在 `/etc/9router/9router.env` 生成仅 root 可读的随机凭据。安装器不会回显密码；请以 root 身份保存该文件并在首次登录后修改密码。直接部署方案与下方“全局 npm 命令 + systemd”方案互斥，请勿在同一台主机混用两套 unit 或更新入口。
 
 日常更新直接执行：
 
@@ -116,6 +118,8 @@ journalctl -u 9router -n 100 --no-pager
 若安装器输出「人工联合恢复：`<路径>`」或「首次安装安全收尾：`<路径>`」，请在确认现场后，以安装器实际输出的 `/run` 脚本路径为准并使用 `sudo <输出的/run 脚本路径>` 执行（例如 `sudo /run/9router-install-recover`）。两类脚本都会校验锁和现场，不能用旧版手工恢复命令替代。相关恢复材料位于 `/run`，重启后会丢失；必须在重启前处理或保留现场并人工核对。
 
 ### systemd
+
+本节适用于全局 npm 安装，不可与上一节的 `/opt/9router` 直接部署方案同时使用。
 
 先确认全局命令的绝对路径：
 

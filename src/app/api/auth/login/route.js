@@ -52,6 +52,15 @@ export async function POST(request) {
       isValid = password === initialPassword;
     }
 
+    // Never turn the compiled-in development password into a remotely usable
+    // credential.  In particular, do this before creating the session cookie.
+    if (isValid && !storedHash && !process.env.INITIAL_PASSWORD && !isLocalRequest(request)) {
+      return NextResponse.json(
+        { error: "Remote password login is unavailable until INITIAL_PASSWORD is initialized." },
+        { status: 503, headers: NO_STORE_HEADERS }
+      );
+    }
+
     if (isValid) {
       recordSuccess(ip);
       const cookieStore = await cookies();
@@ -59,8 +68,7 @@ export async function POST(request) {
 
       // Default password still in use on a remote client → force a password
       // change before the dashboard is exposed remotely (keeps local UX intact).
-      const mustChangePassword =
-        !storedHash && !process.env.INITIAL_PASSWORD && !isLocalRequest(request);
+      const mustChangePassword = false;
 
       return NextResponse.json({ success: true, mustChangePassword }, { headers: NO_STORE_HEADERS });
     }
