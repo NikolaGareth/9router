@@ -34,6 +34,41 @@ UPDATER_PHASE="missing"
 DEPLOY_ROOT_EXISTED=0
 DEPLOY_ROOT_INITIAL_ID=""
 ENV_FILE_CREATED=0
+ENTRYPOINT_STATE_TEMP=""
+ENTRYPOINT_STATE_READY=0
+ENTRYPOINT_PHASE=""
+
+UNIT_STAGED_INODE=""
+UNIT_STAGED_TYPE=""
+UNIT_STAGED_SHA256=""
+UNIT_STAGED_OWNER=""
+UNIT_STAGED_MODE=""
+UNIT_TARGET_INODE=""
+UNIT_TARGET_TYPE=""
+UNIT_TARGET_SHA256=""
+UNIT_TARGET_OWNER=""
+UNIT_TARGET_MODE=""
+UNIT_BACKUP_INODE=""
+UNIT_BACKUP_TYPE=""
+UNIT_BACKUP_SHA256=""
+UNIT_BACKUP_OWNER=""
+UNIT_BACKUP_MODE=""
+
+UPDATER_STAGED_INODE=""
+UPDATER_STAGED_TYPE=""
+UPDATER_STAGED_SHA256=""
+UPDATER_STAGED_OWNER=""
+UPDATER_STAGED_MODE=""
+UPDATER_TARGET_INODE=""
+UPDATER_TARGET_TYPE=""
+UPDATER_TARGET_SHA256=""
+UPDATER_TARGET_OWNER=""
+UPDATER_TARGET_MODE=""
+UPDATER_BACKUP_INODE=""
+UPDATER_BACKUP_TYPE=""
+UPDATER_BACKUP_SHA256=""
+UPDATER_BACKUP_OWNER=""
+UPDATER_BACKUP_MODE=""
 
 die() {
   printf '%s\n' "$*" >&2
@@ -87,6 +122,7 @@ validate_test_root() {
 }
 
 validate_protocol_paths() {
+  local allow_existing="${1:-0}"
   local label
   local path
   local parent
@@ -94,7 +130,7 @@ validate_protocol_paths() {
 
   for label in LOCK_FILE PHASE_FILE RECOVERY_UNIT RECOVERY_UPDATER RECOVERY_ENABLE_STATE \
     RECOVERY_SCRIPT FIRST_INSTALL_CLEANUP_SCRIPT RECOVERY_WORK_UNIT RECOVERY_WORK_UPDATER \
-    RECOVERY_STEP FIRST_INSTALL_CLEANUP_STEP; do
+    RECOVERY_STEP FIRST_INSTALL_CLEANUP_STEP ENTRYPOINT_STATE; do
     path="${!label}"
     parent="${path%/*}"
     [[ -d "$parent" && ! -L "$parent" ]] || die "事务协议父目录不安全：$label"
@@ -110,9 +146,16 @@ validate_protocol_paths() {
   if [[ -e "$PHASE_FILE" && ! -f "$PHASE_FILE" ]]; then
     die "阶段文件必须为不存在或普通文件：$PHASE_FILE"
   fi
+  if [[ "$allow_existing" == 1 ]]; then
+    if [[ -e "$ENTRYPOINT_STATE" && ! -f "$ENTRYPOINT_STATE" ]]; then
+      die "安装入口事务状态必须为不存在或普通文件：$ENTRYPOINT_STATE"
+    fi
+    return 0
+  fi
   for path in "$RECOVERY_UNIT" "$RECOVERY_UPDATER" "$RECOVERY_ENABLE_STATE" \
     "$RECOVERY_SCRIPT" "$FIRST_INSTALL_CLEANUP_SCRIPT" "$RECOVERY_WORK_UNIT" \
-    "$RECOVERY_WORK_UPDATER" "$RECOVERY_STEP" "$FIRST_INSTALL_CLEANUP_STEP"; do
+    "$RECOVERY_WORK_UPDATER" "$RECOVERY_STEP" "$FIRST_INSTALL_CLEANUP_STEP" \
+    "$ENTRYPOINT_STATE"; do
     [[ ! -e "$path" && ! -L "$path" ]] ||
       die "检测到未处理的固定恢复材料，拒绝覆盖：$path"
   done
@@ -146,6 +189,475 @@ updater_material_is_safe() {
 
 updater_recovery_is_safe() {
   updater_material_is_safe "$RECOVERY_UPDATER"
+}
+
+sha256_for_path() {
+  local path="$1"
+  local output
+  local digest
+
+  output="$("$SHA256" "$path")" || return 1
+  digest="${output%% *}"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$digest"
+}
+
+capture_material_metadata() {
+  local path="$1"
+  local kind="$2"
+
+  META_INODE=absent
+  META_TYPE=absent
+  META_SHA256=absent
+  META_OWNER=absent
+  META_MODE=absent
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    return 0
+  fi
+  if [[ -f "$path" && ! -L "$path" ]]; then
+    META_TYPE=file
+  elif [[ "$kind" == unit && -L "$path" && "$(/usr/bin/readlink "$path")" == /dev/null ]]; then
+    META_TYPE=mask
+  else
+    return 1
+  fi
+  META_INODE="$("$STAT" -c '%d:%i' -- "$path")" || return 1
+  META_SHA256="$(sha256_for_path "$path")" || return 1
+  META_OWNER="$("$STAT" -c %u -- "$path")" || return 1
+  META_MODE="$("$STAT" -c %a -- "$path")" || return 1
+  [[ "$META_INODE" =~ ^[0-9]+:[0-9]+$ && "$META_OWNER" =~ ^[0-9]+$ &&
+    "$META_MODE" =~ ^[0-7]{3,4}$ ]] || return 1
+}
+
+capture_recorded_material() {
+  local variable_prefix="$1"
+  local path="$2"
+  local kind="$3"
+
+  capture_material_metadata "$path" "$kind" || return 1
+  printf -v "${variable_prefix}_INODE" '%s' "$META_INODE"
+  printf -v "${variable_prefix}_TYPE" '%s' "$META_TYPE"
+  printf -v "${variable_prefix}_SHA256" '%s' "$META_SHA256"
+  printf -v "${variable_prefix}_OWNER" '%s' "$META_OWNER"
+  printf -v "${variable_prefix}_MODE" '%s' "$META_MODE"
+}
+
+material_matches_record() {
+  local variable_prefix="$1"
+  local path="$2"
+  local kind="$3"
+  local inode_variable="${variable_prefix}_INODE"
+  local type_variable="${variable_prefix}_TYPE"
+  local sha_variable="${variable_prefix}_SHA256"
+  local owner_variable="${variable_prefix}_OWNER"
+  local mode_variable="${variable_prefix}_MODE"
+
+  capture_material_metadata "$path" "$kind" || return 1
+  [[ "$META_INODE" == "${!inode_variable}" &&
+    "$META_TYPE" == "${!type_variable}" &&
+    "$META_SHA256" == "${!sha_variable}" &&
+    "$META_OWNER" == "${!owner_variable}" &&
+    "$META_MODE" == "${!mode_variable}" ]]
+}
+
+write_entrypoint_state() {
+  local next_phase="$1"
+
+  case "$next_phase" in
+    updater_intent|updater_committed|unit_intent|unit_committed) ;;
+    *) return 1 ;;
+  esac
+  ENTRYPOINT_STATE_TEMP="$(/usr/bin/mktemp "${ENTRYPOINT_STATE}.tmp.XXXXXX")" || return 1
+  printf '%s\n' \
+    'version=1' \
+    "phase=$next_phase" \
+    "enable_state=$ENABLE_STATE" \
+    "service_was_active=$SERVICE_WAS_ACTIVE" \
+    "unit_existed=$UNIT_EXISTED" \
+    "unit_staged_path=$UNIT_STAGED" \
+    "unit_staged_inode=$UNIT_STAGED_INODE" \
+    "unit_staged_type=$UNIT_STAGED_TYPE" \
+    "unit_staged_sha256=$UNIT_STAGED_SHA256" \
+    "unit_staged_owner=$UNIT_STAGED_OWNER" \
+    "unit_staged_mode=$UNIT_STAGED_MODE" \
+    "unit_target_path=$SERVICE_TARGET" \
+    "unit_target_inode=$UNIT_TARGET_INODE" \
+    "unit_target_type=$UNIT_TARGET_TYPE" \
+    "unit_target_sha256=$UNIT_TARGET_SHA256" \
+    "unit_target_owner=$UNIT_TARGET_OWNER" \
+    "unit_target_mode=$UNIT_TARGET_MODE" \
+    "unit_backup_path=$RECOVERY_UNIT" \
+    "unit_backup_inode=$UNIT_BACKUP_INODE" \
+    "unit_backup_type=$UNIT_BACKUP_TYPE" \
+    "unit_backup_sha256=$UNIT_BACKUP_SHA256" \
+    "unit_backup_owner=$UNIT_BACKUP_OWNER" \
+    "unit_backup_mode=$UNIT_BACKUP_MODE" \
+    "updater_existed=$UPDATER_EXISTED" \
+    "updater_staged_path=$UPDATER_STAGED" \
+    "updater_staged_inode=$UPDATER_STAGED_INODE" \
+    "updater_staged_type=$UPDATER_STAGED_TYPE" \
+    "updater_staged_sha256=$UPDATER_STAGED_SHA256" \
+    "updater_staged_owner=$UPDATER_STAGED_OWNER" \
+    "updater_staged_mode=$UPDATER_STAGED_MODE" \
+    "updater_target_path=$UPDATER_TARGET" \
+    "updater_target_inode=$UPDATER_TARGET_INODE" \
+    "updater_target_type=$UPDATER_TARGET_TYPE" \
+    "updater_target_sha256=$UPDATER_TARGET_SHA256" \
+    "updater_target_owner=$UPDATER_TARGET_OWNER" \
+    "updater_target_mode=$UPDATER_TARGET_MODE" \
+    "updater_backup_path=$RECOVERY_UPDATER" \
+    "updater_backup_inode=$UPDATER_BACKUP_INODE" \
+    "updater_backup_type=$UPDATER_BACKUP_TYPE" \
+    "updater_backup_sha256=$UPDATER_BACKUP_SHA256" \
+    "updater_backup_owner=$UPDATER_BACKUP_OWNER" \
+    "updater_backup_mode=$UPDATER_BACKUP_MODE" >"$ENTRYPOINT_STATE_TEMP" || {
+      cleanup_path "$ENTRYPOINT_STATE_TEMP" || true
+      ENTRYPOINT_STATE_TEMP=""
+      return 1
+    }
+  /bin/chmod 0600 "$ENTRYPOINT_STATE_TEMP" || {
+    cleanup_path "$ENTRYPOINT_STATE_TEMP" || true
+    ENTRYPOINT_STATE_TEMP=""
+    return 1
+  }
+  "$MV" -fT -- "$ENTRYPOINT_STATE_TEMP" "$ENTRYPOINT_STATE" || {
+    cleanup_path "$ENTRYPOINT_STATE_TEMP" || true
+    ENTRYPOINT_STATE_TEMP=""
+    return 1
+  }
+  ENTRYPOINT_STATE_TEMP=""
+  ENTRYPOINT_PHASE="$next_phase"
+  ENTRYPOINT_STATE_READY=1
+}
+
+read_state_value() {
+  local expected_key="$1"
+  local destination_variable="$2"
+  local line
+
+  IFS= read -r line <&7 || return 1
+  [[ "$line" == "$expected_key="* && "$line" != "$expected_key=" ]] || return 1
+  printf -v "$destination_variable" '%s' "${line#*=}"
+}
+
+entrypoint_record_shape_is_valid() {
+  local prefix="$1"
+  local kind="$2"
+  local target_path="$3"
+  local backup_path="$4"
+  local staged_path_variable="${prefix}_STAGED"
+  local target_type_variable="${prefix}_TARGET_TYPE"
+  local target_inode_variable="${prefix}_TARGET_INODE"
+  local target_sha_variable="${prefix}_TARGET_SHA256"
+  local target_owner_variable="${prefix}_TARGET_OWNER"
+  local target_mode_variable="${prefix}_TARGET_MODE"
+  local backup_type_variable="${prefix}_BACKUP_TYPE"
+  local backup_inode_variable="${prefix}_BACKUP_INODE"
+  local backup_sha_variable="${prefix}_BACKUP_SHA256"
+  local backup_owner_variable="${prefix}_BACKUP_OWNER"
+  local backup_mode_variable="${prefix}_BACKUP_MODE"
+  local staged_type_variable="${prefix}_STAGED_TYPE"
+  local staged_inode_variable="${prefix}_STAGED_INODE"
+  local staged_sha_variable="${prefix}_STAGED_SHA256"
+  local staged_owner_variable="${prefix}_STAGED_OWNER"
+  local staged_mode_variable="${prefix}_STAGED_MODE"
+  local existed_variable="${prefix}_EXISTED"
+  local staged_prefix="${target_path}.new."
+
+  [[ "${!existed_variable}" =~ ^[01]$ && "${!staged_path_variable}" == "$staged_prefix"* &&
+    "${!staged_type_variable}" == file && "${!staged_inode_variable}" =~ ^[0-9]+:[0-9]+$ &&
+    "${!staged_sha_variable}" =~ ^[0-9a-f]{64}$ && "${!staged_owner_variable}" =~ ^[0-9]+$ &&
+    "${!staged_mode_variable}" =~ ^[0-7]{3,4}$ ]] || return 1
+  if [[ "${!existed_variable}" == 1 ]]; then
+    case "${!target_type_variable}" in
+      file) ;;
+      mask) [[ "$kind" == unit ]] || return 1 ;;
+      *) return 1 ;;
+    esac
+    [[ "${!backup_type_variable}" == "${!target_type_variable}" &&
+      "${!target_inode_variable}" =~ ^[0-9]+:[0-9]+$ &&
+      "${!backup_inode_variable}" =~ ^[0-9]+:[0-9]+$ &&
+      "${!target_sha_variable}" =~ ^[0-9a-f]{64}$ &&
+      "${!backup_sha_variable}" == "${!target_sha_variable}" &&
+      "${!target_owner_variable}" =~ ^[0-9]+$ &&
+      "${!backup_owner_variable}" == "${!target_owner_variable}" &&
+      "${!target_mode_variable}" =~ ^[0-7]{3,4}$ &&
+      "${!backup_mode_variable}" == "${!target_mode_variable}" ]] || return 1
+  else
+    [[ "${!target_type_variable}" == absent && "${!target_inode_variable}" == absent &&
+      "${!target_sha_variable}" == absent && "${!target_owner_variable}" == absent &&
+      "${!target_mode_variable}" == absent && "${!backup_type_variable}" == absent &&
+      "${!backup_inode_variable}" == absent && "${!backup_sha_variable}" == absent &&
+      "${!backup_owner_variable}" == absent && "${!backup_mode_variable}" == absent ]] || return 1
+  fi
+  [[ -n "$target_path" && -n "$backup_path" ]]
+}
+
+load_entrypoint_state() {
+  local state_version
+  local state_unit_target_path state_unit_backup_path
+  local state_updater_target_path state_updater_backup_path
+  local extra_line
+
+  [[ -f "$ENTRYPOINT_STATE" && ! -L "$ENTRYPOINT_STATE" ]] || return 1
+  existing_entry_is_private "$ENTRYPOINT_STATE" || return 1
+  [[ "$("$STAT" -c %a -- "$ENTRYPOINT_STATE")" == 600 ]] || return 1
+  exec 7<"$ENTRYPOINT_STATE" || return 1
+  read_state_value version state_version &&
+    read_state_value phase ENTRYPOINT_PHASE &&
+    read_state_value enable_state ENABLE_STATE &&
+    read_state_value service_was_active SERVICE_WAS_ACTIVE &&
+    read_state_value unit_existed UNIT_EXISTED &&
+    read_state_value unit_staged_path UNIT_STAGED &&
+    read_state_value unit_staged_inode UNIT_STAGED_INODE &&
+    read_state_value unit_staged_type UNIT_STAGED_TYPE &&
+    read_state_value unit_staged_sha256 UNIT_STAGED_SHA256 &&
+    read_state_value unit_staged_owner UNIT_STAGED_OWNER &&
+    read_state_value unit_staged_mode UNIT_STAGED_MODE &&
+    read_state_value unit_target_path state_unit_target_path &&
+    read_state_value unit_target_inode UNIT_TARGET_INODE &&
+    read_state_value unit_target_type UNIT_TARGET_TYPE &&
+    read_state_value unit_target_sha256 UNIT_TARGET_SHA256 &&
+    read_state_value unit_target_owner UNIT_TARGET_OWNER &&
+    read_state_value unit_target_mode UNIT_TARGET_MODE &&
+    read_state_value unit_backup_path state_unit_backup_path &&
+    read_state_value unit_backup_inode UNIT_BACKUP_INODE &&
+    read_state_value unit_backup_type UNIT_BACKUP_TYPE &&
+    read_state_value unit_backup_sha256 UNIT_BACKUP_SHA256 &&
+    read_state_value unit_backup_owner UNIT_BACKUP_OWNER &&
+    read_state_value unit_backup_mode UNIT_BACKUP_MODE &&
+    read_state_value updater_existed UPDATER_EXISTED &&
+    read_state_value updater_staged_path UPDATER_STAGED &&
+    read_state_value updater_staged_inode UPDATER_STAGED_INODE &&
+    read_state_value updater_staged_type UPDATER_STAGED_TYPE &&
+    read_state_value updater_staged_sha256 UPDATER_STAGED_SHA256 &&
+    read_state_value updater_staged_owner UPDATER_STAGED_OWNER &&
+    read_state_value updater_staged_mode UPDATER_STAGED_MODE &&
+    read_state_value updater_target_path state_updater_target_path &&
+    read_state_value updater_target_inode UPDATER_TARGET_INODE &&
+    read_state_value updater_target_type UPDATER_TARGET_TYPE &&
+    read_state_value updater_target_sha256 UPDATER_TARGET_SHA256 &&
+    read_state_value updater_target_owner UPDATER_TARGET_OWNER &&
+    read_state_value updater_target_mode UPDATER_TARGET_MODE &&
+    read_state_value updater_backup_path state_updater_backup_path &&
+    read_state_value updater_backup_inode UPDATER_BACKUP_INODE &&
+    read_state_value updater_backup_type UPDATER_BACKUP_TYPE &&
+    read_state_value updater_backup_sha256 UPDATER_BACKUP_SHA256 &&
+    read_state_value updater_backup_owner UPDATER_BACKUP_OWNER &&
+    read_state_value updater_backup_mode UPDATER_BACKUP_MODE || {
+      exec 7<&-
+      return 1
+    }
+  if IFS= read -r extra_line <&7; then
+    exec 7<&-
+    return 1
+  fi
+  exec 7<&-
+
+  [[ "$state_version" == 1 && "$SERVICE_WAS_ACTIVE" =~ ^[01]$ ]] || return 1
+  case "$ENTRYPOINT_PHASE" in
+    updater_intent|updater_committed|unit_intent|unit_committed) ;;
+    *) return 1 ;;
+  esac
+  case "$ENABLE_STATE" in enabled|disabled|masked|not-found) ;; *) return 1 ;; esac
+  [[ "$state_unit_target_path" == "$SERVICE_TARGET" &&
+    "$state_unit_backup_path" == "$RECOVERY_UNIT" &&
+    "$state_updater_target_path" == "$UPDATER_TARGET" &&
+    "$state_updater_backup_path" == "$RECOVERY_UPDATER" ]] || return 1
+  entrypoint_record_shape_is_valid UNIT unit "$SERVICE_TARGET" "$RECOVERY_UNIT" || return 1
+  entrypoint_record_shape_is_valid UPDATER updater "$UPDATER_TARGET" "$RECOVERY_UPDATER" || return 1
+  ENTRYPOINT_STATE_READY=1
+}
+
+entrypoint_target_scene() {
+  local prefix="$1"
+  local kind="$2"
+  local target="$3"
+  local existed_variable="${prefix}_EXISTED"
+
+  if material_matches_record "${prefix}_STAGED" "$target" "$kind"; then
+    printf 'new\n'
+  elif [[ "${!existed_variable}" == 1 ]] &&
+    material_matches_record "${prefix}_TARGET" "$target" "$kind"; then
+    printf 'old_original\n'
+  elif [[ "${!existed_variable}" == 1 ]] &&
+    material_matches_record "${prefix}_BACKUP" "$target" "$kind"; then
+    printf 'old_restored\n'
+  elif [[ "${!existed_variable}" == 0 && ! -e "$target" && ! -L "$target" ]]; then
+    printf 'absent\n'
+  else
+    return 1
+  fi
+}
+
+entrypoint_staged_scene() {
+  local prefix="$1"
+  local kind="$2"
+  local staged_variable="${prefix}_STAGED"
+  local staged="${!staged_variable}"
+
+  if material_matches_record "${prefix}_STAGED" "$staged" "$kind"; then
+    printf 'staged\n'
+  elif [[ ! -e "$staged" && ! -L "$staged" ]]; then
+    printf 'absent\n'
+  else
+    return 1
+  fi
+}
+
+entrypoint_backup_scene() {
+  local prefix="$1"
+  local kind="$2"
+  local backup="$3"
+  local existed_variable="${prefix}_EXISTED"
+
+  if [[ "${!existed_variable}" == 1 ]] &&
+    material_matches_record "${prefix}_BACKUP" "$backup" "$kind"; then
+    printf 'ready\n'
+  elif [[ ! -e "$backup" && ! -L "$backup" ]]; then
+    printf 'absent\n'
+  else
+    return 1
+  fi
+}
+
+validate_entrypoint_scene() {
+  local prefix="$1" kind="$2" target="$3" backup="$4"
+  local existed_variable="${prefix}_EXISTED"
+  local target_scene staged_scene backup_scene
+
+  target_scene="$(entrypoint_target_scene "$prefix" "$kind" "$target")" || return 1
+  staged_scene="$(entrypoint_staged_scene "$prefix" "$kind")" || return 1
+  backup_scene="$(entrypoint_backup_scene "$prefix" "$kind" "$backup")" || return 1
+  if [[ "${!existed_variable}" == 1 ]]; then
+    case "$target_scene:$backup_scene" in
+      new:ready|old_original:ready|old_restored:absent) ;;
+      *) return 1 ;;
+    esac
+  else
+    [[ "$backup_scene" == absent ]] || return 1
+    case "$target_scene" in new|absent) ;; *) return 1 ;; esac
+  fi
+  case "$target_scene:$staged_scene" in
+    new:absent|old_original:staged|old_original:absent|old_restored:absent|absent:staged|absent:absent) ;;
+    *) return 1 ;;
+  esac
+}
+
+restore_recorded_entrypoint() {
+  local prefix="$1" kind="$2" target="$3" backup="$4"
+  local existed_variable="${prefix}_EXISTED"
+  local staged_variable="${prefix}_STAGED"
+  local staged="${!staged_variable}"
+  local target_scene backup_scene staged_scene
+
+  target_scene="$(entrypoint_target_scene "$prefix" "$kind" "$target")" || return 1
+  backup_scene="$(entrypoint_backup_scene "$prefix" "$kind" "$backup")" || return 1
+  staged_scene="$(entrypoint_staged_scene "$prefix" "$kind")" || return 1
+  if [[ "$target_scene" == new ]]; then
+    if [[ "${!existed_variable}" == 1 ]]; then
+      [[ "$backup_scene" == ready ]] || return 1
+      "$MV" -fT -- "$backup" "$target" || return 1
+      material_matches_record "${prefix}_BACKUP" "$target" "$kind" || return 1
+      [[ ! -e "$backup" && ! -L "$backup" ]] || return 1
+    else
+      "$RM" -f -- "$target" || return 1
+      [[ ! -e "$target" && ! -L "$target" ]] || return 1
+    fi
+  elif [[ "$target_scene" == old_original && "$backup_scene" == ready ]]; then
+    cleanup_path "$backup" || return 1
+  elif [[ "$target_scene" == old_restored && "$backup_scene" == absent ]]; then
+    :
+  elif [[ "$target_scene" == absent && "${!existed_variable}" == 0 ]]; then
+    :
+  else
+    return 1
+  fi
+  if [[ "$staged_scene" == staged ]]; then
+    cleanup_path "$staged" || return 1
+  fi
+}
+
+remove_entrypoint_state() {
+  [[ -f "$ENTRYPOINT_STATE" && ! -L "$ENTRYPOINT_STATE" ]] || return 1
+  cleanup_path "$ENTRYPOINT_STATE" || return 1
+  ENTRYPOINT_STATE_READY=0
+  ENTRYPOINT_PHASE=""
+}
+
+prepare_absent_unit_restore() {
+  local target_scene
+
+  (( UNIT_EXISTED == 0 )) || return 0
+  [[ "$ENABLE_STATE" == not-found ]] || return 0
+  target_scene="$(entrypoint_target_scene UNIT unit "$SERVICE_TARGET")" || return 1
+  case "$target_scene" in
+    new)
+      "$SYSTEMCTL" disable 9router || return 1
+      ;;
+    absent) ;;
+    *) return 1 ;;
+  esac
+}
+
+confirm_new_entrypoints() {
+  [[ "$(entrypoint_target_scene UNIT unit "$SERVICE_TARGET")" == new &&
+    "$(entrypoint_staged_scene UNIT unit)" == absent &&
+    "$(entrypoint_target_scene UPDATER updater "$UPDATER_TARGET")" == new &&
+    "$(entrypoint_staged_scene UPDATER updater)" == absent ]] || return 1
+  validate_entrypoint_scene UNIT unit "$SERVICE_TARGET" "$RECOVERY_UNIT" || return 1
+  validate_entrypoint_scene UPDATER updater "$UPDATER_TARGET" "$RECOVERY_UPDATER" || return 1
+  remove_entrypoint_state
+}
+
+reconcile_entrypoint_transaction() {
+  local mode="${1:-auto}"
+  local updater_phase=missing
+
+  [[ -e "$ENTRYPOINT_STATE" || -L "$ENTRYPOINT_STATE" ]] || return 0
+  load_entrypoint_state || {
+    printf '安装入口事务状态无效；未修改任何入口或恢复材料：%s\n' "$ENTRYPOINT_STATE" >&2
+    return 1
+  }
+  validate_entrypoint_scene UNIT unit "$SERVICE_TARGET" "$RECOVERY_UNIT" || {
+    printf 'unit 入口事务现场与持久化 intent 不一致；拒绝调和。\n' >&2
+    return 1
+  }
+  validate_entrypoint_scene UPDATER updater "$UPDATER_TARGET" "$RECOVERY_UPDATER" || {
+    printf 'updater 入口事务现场与持久化 intent 不一致；拒绝调和。\n' >&2
+    return 1
+  }
+  if [[ "$mode" == auto ]]; then
+    updater_phase="$(read_updater_phase)"
+    case "$updater_phase" in
+      old_move_intent|old_moved|new_move_intent|new_moved|started|healthy|health_failed)
+        confirm_new_entrypoints || return 1
+        printf '已核验并提交切换后的新 unit/updater 入口；固定恢复材料保持原样。\n' >&2
+        return 0
+        ;;
+    esac
+  fi
+
+  prepare_absent_unit_restore || return 1
+  restore_recorded_entrypoint UNIT unit "$SERVICE_TARGET" "$RECOVERY_UNIT" || return 1
+  restore_recorded_entrypoint UPDATER updater "$UPDATER_TARGET" "$RECOVERY_UPDATER" || return 1
+  "$SYSTEMCTL" daemon-reload || return 1
+  restore_enable_state || return 1
+  if (( SERVICE_WAS_ACTIVE == 1 )) && [[ "$ENABLE_STATE" != masked ]]; then
+    "$SYSTEMCTL" start 9router || return 1
+  fi
+  if [[ -f "$RECOVERY_ENABLE_STATE" && ! -L "$RECOVERY_ENABLE_STATE" &&
+    "$(<"$RECOVERY_ENABLE_STATE")" == "$ENABLE_STATE" ]]; then
+    cleanup_path "$RECOVERY_ENABLE_STATE" || return 1
+  else
+    return 1
+  fi
+  remove_entrypoint_state
+  UNIT_DEPLOYED=0
+  UPDATER_DEPLOYED=0
+  UNIT_BACKUP_READY=0
+  UPDATER_BACKUP_READY=0
+  ENABLE_STATE_READY=0
 }
 
 existing_entry_is_private() {
@@ -204,7 +716,7 @@ restore_enable_state() {
     enabled) "$SYSTEMCTL" enable 9router ;;
     disabled) "$SYSTEMCTL" disable 9router ;;
     masked) "$SYSTEMCTL" mask 9router ;;
-    not-found) "$SYSTEMCTL" disable 9router ;;
+    not-found) : ;;
     *) return 1 ;;
   esac
 }
@@ -217,7 +729,7 @@ cleanup_unready_temps() {
     "$UPDATER_BACKUP_TEMP" "$ENABLE_STATE_TEMP" "$RECOVERY_SCRIPT_TEMP" \
     "$FIRST_INSTALL_CLEANUP_SCRIPT_TEMP" "$RECOVERY_WORK_UNIT_TEMP" \
     "$RECOVERY_WORK_UPDATER_TEMP" "$RECOVERY_STEP_TEMP" \
-    "$FIRST_INSTALL_CLEANUP_STEP_TEMP"; do
+    "$FIRST_INSTALL_CLEANUP_STEP_TEMP" "$ENTRYPOINT_STATE_TEMP"; do
     cleanup_path "$path" || cleanup_failed=1
   done
   return "$cleanup_failed"
@@ -228,6 +740,16 @@ restore_pre_switch() {
   local unit_changed="$UNIT_DEPLOYED"
 
   cleanup_unready_temps || restore_failed=1
+
+  if [[ -e "$ENTRYPOINT_STATE" || -L "$ENTRYPOINT_STATE" ]]; then
+    if reconcile_entrypoint_transaction restore; then
+      TRANSACTION_ACTIVE=0
+      return "$restore_failed"
+    fi
+    printf '持久化安装入口事务调和失败；固定材料与无法确认的入口保持原样。\n' >&2
+    TRANSACTION_ACTIVE=0
+    return 1
+  fi
 
   if (( UNIT_DEPLOYED == 1 )); then
     if (( UNIT_EXISTED == 1 )); then
@@ -390,17 +912,44 @@ write_joint_recovery_script() {
   local lock_identity phase_identity unit_identity recovery_updater_identity
   local enable_identity previous_identity service_identity updater_identity
   local work_unit_identity work_updater_identity recovery_token
+  local unit_sha256=absent unit_type=absent unit_owner=absent unit_mode=absent
+  local recovery_updater_sha256=absent recovery_updater_type=absent
+  local recovery_updater_owner=absent recovery_updater_mode=absent
+  local work_unit_sha256=absent work_unit_type=absent work_unit_owner=absent work_unit_mode=absent
+  local work_updater_sha256=absent work_updater_type=absent
+  local work_updater_owner=absent work_updater_mode=absent
+  local service_sha256 service_type service_owner service_mode
+  local updater_sha256 updater_type updater_owner updater_mode
   local root_state=absent root_identity='' build_state=absent build_identity=''
   local script_write_count=0
   local script_write_fail_at="${NINEROUTER_TEST_FAIL_SCRIPT_WRITE_AT:-0}"
   local script_write_failed=0
   local path
 
-  (( UNIT_EXISTED == 1 && UPDATER_EXISTED == 1 &&
-    UNIT_BACKUP_READY == 1 && UPDATER_BACKUP_READY == 1 )) || return 1
-  unit_recovery_is_safe || return 1
-  updater_recovery_is_safe || return 1
-  [[ -x "$RECOVERY_UPDATER" ]] || return 1
+  [[ "$UNIT_EXISTED" =~ ^[01]$ && "$UPDATER_EXISTED" =~ ^[01]$ ]] || return 1
+  (( UNIT_BACKUP_READY == UNIT_EXISTED &&
+    UPDATER_BACKUP_READY == UPDATER_EXISTED )) || return 1
+  if (( UNIT_EXISTED == 1 )); then
+    unit_recovery_is_safe || return 1
+    material_matches_record UNIT_BACKUP "$RECOVERY_UNIT" unit || return 1
+    unit_sha256="$UNIT_BACKUP_SHA256"
+    unit_type="$UNIT_BACKUP_TYPE"
+    unit_owner="$UNIT_BACKUP_OWNER"
+    unit_mode="$UNIT_BACKUP_MODE"
+  else
+    path_is_absent "$RECOVERY_UNIT" || return 1
+  fi
+  if (( UPDATER_EXISTED == 1 )); then
+    updater_recovery_is_safe || return 1
+    [[ -x "$RECOVERY_UPDATER" ]] || return 1
+    material_matches_record UPDATER_BACKUP "$RECOVERY_UPDATER" updater || return 1
+    recovery_updater_sha256="$UPDATER_BACKUP_SHA256"
+    recovery_updater_type="$UPDATER_BACKUP_TYPE"
+    recovery_updater_owner="$UPDATER_BACKUP_OWNER"
+    recovery_updater_mode="$UPDATER_BACKUP_MODE"
+  else
+    path_is_absent "$RECOVERY_UPDATER" || return 1
+  fi
   [[ -f "$RECOVERY_ENABLE_STATE" && ! -L "$RECOVERY_ENABLE_STATE" ]] || return 1
   [[ "$(<"$RECOVERY_ENABLE_STATE")" == "$ENABLE_STATE" ]] || return 1
   [[ -f "$PHASE_FILE" && ! -L "$PHASE_FILE" ]] || return 1
@@ -408,6 +957,16 @@ write_joint_recovery_script() {
   path_is_safe_directory "$PREVIOUS_DIR" || return 1
   [[ -f "$SERVICE_TARGET" && ! -L "$SERVICE_TARGET" ]] || return 1
   [[ -f "$UPDATER_TARGET" && ! -L "$UPDATER_TARGET" ]] || return 1
+  material_matches_record UNIT_STAGED "$SERVICE_TARGET" unit || return 1
+  material_matches_record UPDATER_STAGED "$UPDATER_TARGET" updater || return 1
+  service_sha256="$UNIT_STAGED_SHA256"
+  service_type="$UNIT_STAGED_TYPE"
+  service_owner="$UNIT_STAGED_OWNER"
+  service_mode="$UNIT_STAGED_MODE"
+  updater_sha256="$UPDATER_STAGED_SHA256"
+  updater_type="$UPDATER_STAGED_TYPE"
+  updater_owner="$UPDATER_STAGED_OWNER"
+  updater_mode="$UPDATER_STAGED_MODE"
   path_is_absent "$FAILED_ROOT" || return 1
   for path in "$RECOVERY_SCRIPT" "$RECOVERY_WORK_UNIT" "$RECOVERY_WORK_UPDATER" \
     "$RECOVERY_STEP"; do
@@ -426,46 +985,97 @@ write_joint_recovery_script() {
 
   lock_identity="$("$STAT" -Lc '%d:%i' -- "$LOCK_FILE")" || return 1
   phase_identity="$("$STAT" -Lc '%d:%i' -- "$PHASE_FILE")" || return 1
-  unit_identity="$("$STAT" -c '%d:%i' -- "$RECOVERY_UNIT")" || return 1
-  recovery_updater_identity="$("$STAT" -Lc '%d:%i' -- "$RECOVERY_UPDATER")" ||
-    return 1
+  unit_identity=absent
+  recovery_updater_identity=absent
+  if (( UNIT_EXISTED == 1 )); then
+    unit_identity="$("$STAT" -c '%d:%i' -- "$RECOVERY_UNIT")" || return 1
+  fi
+  if (( UPDATER_EXISTED == 1 )); then
+    recovery_updater_identity="$("$STAT" -Lc '%d:%i' -- "$RECOVERY_UPDATER")" ||
+      return 1
+  fi
   enable_identity="$("$STAT" -Lc '%d:%i' -- "$RECOVERY_ENABLE_STATE")" || return 1
   previous_identity="$("$STAT" -Lc '%d:%i' -- "$PREVIOUS_DIR")" || return 1
   service_identity="$("$STAT" -Lc '%d:%i' -- "$SERVICE_TARGET")" || return 1
   updater_identity="$("$STAT" -Lc '%d:%i' -- "$UPDATER_TARGET")" || return 1
 
-  RECOVERY_WORK_UNIT_TEMP="$(/usr/bin/mktemp "${RECOVERY_WORK_UNIT}.tmp.XXXXXX")" ||
-    return 1
-  if ! "$CP" -a -- "$RECOVERY_UNIT" "$RECOVERY_WORK_UNIT_TEMP" ||
-    ! unit_material_is_safe "$RECOVERY_WORK_UNIT_TEMP" ||
-    ! "$MV" -fT -- "$RECOVERY_WORK_UNIT_TEMP" "$RECOVERY_WORK_UNIT"; then
-    cleanup_joint_generation || true
-    return 1
+  work_unit_identity=absent
+  work_updater_identity=absent
+  if (( UNIT_EXISTED == 1 )); then
+    RECOVERY_WORK_UNIT_TEMP="$(/usr/bin/mktemp "${RECOVERY_WORK_UNIT}.tmp.XXXXXX")" ||
+      return 1
+    if ! "$CP" -a -- "$RECOVERY_UNIT" "$RECOVERY_WORK_UNIT_TEMP" ||
+      ! unit_material_is_safe "$RECOVERY_WORK_UNIT_TEMP" ||
+      ! "$MV" -fT -- "$RECOVERY_WORK_UNIT_TEMP" "$RECOVERY_WORK_UNIT"; then
+      cleanup_joint_generation || true
+      return 1
+    fi
+    RECOVERY_WORK_UNIT_TEMP=""
+    work_unit_identity="$("$STAT" -c '%d:%i' -- "$RECOVERY_WORK_UNIT")" || {
+      cleanup_joint_generation || true
+      return 1
+    }
+    capture_material_metadata "$RECOVERY_WORK_UNIT" unit || {
+      cleanup_joint_generation || true
+      return 1
+    }
+    [[ "$META_SHA256" == "$unit_sha256" && "$META_TYPE" == "$unit_type" &&
+      "$META_OWNER" == "$unit_owner" && "$META_MODE" == "$unit_mode" ]] || {
+      cleanup_joint_generation || true
+      return 1
+    }
+    work_unit_sha256="$META_SHA256"
+    work_unit_type="$META_TYPE"
+    work_unit_owner="$META_OWNER"
+    work_unit_mode="$META_MODE"
   fi
-  RECOVERY_WORK_UNIT_TEMP=""
 
-  RECOVERY_WORK_UPDATER_TEMP="$(/usr/bin/mktemp "${RECOVERY_WORK_UPDATER}.tmp.XXXXXX")" || {
-    cleanup_joint_generation || true
-    return 1
-  }
-  if ! "$CP" -a -- "$RECOVERY_UPDATER" "$RECOVERY_WORK_UPDATER_TEMP" ||
-    ! updater_material_is_safe "$RECOVERY_WORK_UPDATER_TEMP" ||
-    [[ ! -x "$RECOVERY_WORK_UPDATER_TEMP" ]] ||
-    ! "$MV" -fT -- "$RECOVERY_WORK_UPDATER_TEMP" "$RECOVERY_WORK_UPDATER"; then
-    cleanup_joint_generation || true
-    return 1
+  if (( UPDATER_EXISTED == 1 )); then
+    RECOVERY_WORK_UPDATER_TEMP="$(/usr/bin/mktemp "${RECOVERY_WORK_UPDATER}.tmp.XXXXXX")" || {
+      cleanup_joint_generation || true
+      return 1
+    }
+    if ! "$CP" -a -- "$RECOVERY_UPDATER" "$RECOVERY_WORK_UPDATER_TEMP" ||
+      ! updater_material_is_safe "$RECOVERY_WORK_UPDATER_TEMP" ||
+      [[ ! -x "$RECOVERY_WORK_UPDATER_TEMP" ]] ||
+      ! "$MV" -fT -- "$RECOVERY_WORK_UPDATER_TEMP" "$RECOVERY_WORK_UPDATER"; then
+      cleanup_joint_generation || true
+      return 1
+    fi
+    RECOVERY_WORK_UPDATER_TEMP=""
+    work_updater_identity="$("$STAT" -Lc '%d:%i' -- "$RECOVERY_WORK_UPDATER")" || {
+      cleanup_joint_generation || true
+      return 1
+    }
+    capture_material_metadata "$RECOVERY_WORK_UPDATER" updater || {
+      cleanup_joint_generation || true
+      return 1
+    }
+    [[ "$META_SHA256" == "$recovery_updater_sha256" &&
+      "$META_TYPE" == "$recovery_updater_type" &&
+      "$META_OWNER" == "$recovery_updater_owner" &&
+      "$META_MODE" == "$recovery_updater_mode" ]] || {
+      cleanup_joint_generation || true
+      return 1
+    }
+    work_updater_sha256="$META_SHA256"
+    work_updater_type="$META_TYPE"
+    work_updater_owner="$META_OWNER"
+    work_updater_mode="$META_MODE"
   fi
-  RECOVERY_WORK_UPDATER_TEMP=""
-
-  work_unit_identity="$("$STAT" -c '%d:%i' -- "$RECOVERY_WORK_UNIT")" || {
-    cleanup_joint_generation || true
-    return 1
-  }
-  work_updater_identity="$("$STAT" -Lc '%d:%i' -- "$RECOVERY_WORK_UPDATER")" || {
-    cleanup_joint_generation || true
-    return 1
-  }
-  recovery_token="${lock_identity}:${phase_identity}:${previous_identity}:${work_unit_identity}:${work_updater_identity}"
+  if (( UNIT_EXISTED == 1 )); then
+    material_matches_record UNIT_BACKUP "$RECOVERY_UNIT" unit || {
+      cleanup_joint_generation || true
+      return 1
+    }
+  fi
+  if (( UPDATER_EXISTED == 1 )); then
+    material_matches_record UPDATER_BACKUP "$RECOVERY_UPDATER" updater || {
+      cleanup_joint_generation || true
+      return 1
+    }
+  fi
+  recovery_token="${lock_identity}:${phase_identity}:${previous_identity}:${UNIT_EXISTED}:${UPDATER_EXISTED}:${work_unit_identity}:${work_updater_identity}"
 
   RECOVERY_STEP_TEMP="$(/usr/bin/mktemp "${RECOVERY_STEP}.tmp.XXXXXX")" || {
     cleanup_joint_generation || true
@@ -499,22 +1109,38 @@ write_joint_recovery_script() {
       script_write_failed=1
     script_printf 'SERVICE_TARGET=%q\nUPDATER_TARGET=%q\n' \
       "$SERVICE_TARGET" "$UPDATER_TARGET" || script_write_failed=1
-    script_printf 'SYSTEMCTL=%q\nFLOCK=%q\nSTAT=%q\nMV=%q\nRM=%q\n' \
-      "$SYSTEMCTL" "$FLOCK" "$STAT" "$MV" "$RM" || script_write_failed=1
+    script_printf 'SYSTEMCTL=%q\nFLOCK=%q\nSTAT=%q\nSHA256=%q\nMV=%q\nRM=%q\n' \
+      "$SYSTEMCTL" "$FLOCK" "$STAT" "$SHA256" "$MV" "$RM" || script_write_failed=1
     script_printf 'EXPECTED_LOCK_ID=%q\nEXPECTED_PHASE=%q\nEXPECTED_PHASE_ID=%q\n' \
       "$lock_identity" "$UPDATER_PHASE" "$phase_identity" || script_write_failed=1
     script_printf 'EXPECTED_UNIT_ID=%q\nEXPECTED_RECOVERY_UPDATER_ID=%q\nEXPECTED_ENABLE_ID=%q\n' \
       "$unit_identity" "$recovery_updater_identity" "$enable_identity" || script_write_failed=1
+    script_printf 'EXPECTED_UNIT_SHA256=%q\nEXPECTED_UNIT_TYPE=%q\nEXPECTED_UNIT_OWNER=%q\nEXPECTED_UNIT_MODE=%q\n' \
+      "$unit_sha256" "$unit_type" "$unit_owner" "$unit_mode" || script_write_failed=1
+    script_printf 'EXPECTED_RECOVERY_UPDATER_SHA256=%q\nEXPECTED_RECOVERY_UPDATER_TYPE=%q\nEXPECTED_RECOVERY_UPDATER_OWNER=%q\nEXPECTED_RECOVERY_UPDATER_MODE=%q\n' \
+      "$recovery_updater_sha256" "$recovery_updater_type" \
+      "$recovery_updater_owner" "$recovery_updater_mode" || script_write_failed=1
     script_printf 'EXPECTED_WORK_UNIT_ID=%q\nEXPECTED_WORK_UPDATER_ID=%q\n' \
       "$work_unit_identity" "$work_updater_identity" || script_write_failed=1
+    script_printf 'EXPECTED_WORK_UNIT_SHA256=%q\nEXPECTED_WORK_UNIT_TYPE=%q\nEXPECTED_WORK_UNIT_OWNER=%q\nEXPECTED_WORK_UNIT_MODE=%q\n' \
+      "$work_unit_sha256" "$work_unit_type" "$work_unit_owner" "$work_unit_mode" || script_write_failed=1
+    script_printf 'EXPECTED_WORK_UPDATER_SHA256=%q\nEXPECTED_WORK_UPDATER_TYPE=%q\nEXPECTED_WORK_UPDATER_OWNER=%q\nEXPECTED_WORK_UPDATER_MODE=%q\n' \
+      "$work_updater_sha256" "$work_updater_type" \
+      "$work_updater_owner" "$work_updater_mode" || script_write_failed=1
     script_printf 'EXPECTED_PREVIOUS_ID=%q\nEXPECTED_SERVICE_ID=%q\nEXPECTED_UPDATER_ID=%q\n' \
       "$previous_identity" "$service_identity" "$updater_identity" || script_write_failed=1
+    script_printf 'EXPECTED_SERVICE_SHA256=%q\nEXPECTED_SERVICE_TYPE=%q\nEXPECTED_SERVICE_OWNER=%q\nEXPECTED_SERVICE_MODE=%q\n' \
+      "$service_sha256" "$service_type" "$service_owner" "$service_mode" || script_write_failed=1
+    script_printf 'EXPECTED_UPDATER_SHA256=%q\nEXPECTED_UPDATER_TYPE=%q\nEXPECTED_UPDATER_OWNER=%q\nEXPECTED_UPDATER_MODE=%q\n' \
+      "$updater_sha256" "$updater_type" "$updater_owner" "$updater_mode" || script_write_failed=1
     script_printf 'EXPECTED_ROOT_STATE=%q\nEXPECTED_ROOT_ID=%q\n' \
       "$root_state" "$root_identity" || script_write_failed=1
     script_printf 'EXPECTED_BUILD_STATE=%q\nEXPECTED_BUILD_ID=%q\n' \
       "$build_state" "$build_identity" || script_write_failed=1
     script_printf 'EXPECTED_ENABLE_STATE=%q\nEXPECTED_SERVICE_WAS_ACTIVE=%q\n' \
       "$ENABLE_STATE" "$SERVICE_WAS_ACTIVE" || script_write_failed=1
+    script_printf 'UNIT_EXISTED=%q\nUPDATER_EXISTED=%q\n' \
+      "$UNIT_EXISTED" "$UPDATER_EXISTED" || script_write_failed=1
     script_printf 'EXPECTED_TOKEN=%q\n' "$recovery_token" || script_write_failed=1
     while IFS= read -r line; do
       script_printf '%s\n' "$line" || script_write_failed=1
@@ -541,22 +1167,75 @@ same_path_inode() {
   [[ "$actual" == "$expected" ]]
 }
 
-safe_unit_with_id() {
-  local expected="$1" path="$2"
+safe_material_with_metadata() {
+  local expected_id="$1" expected_type="$2" expected_sha="$3"
+  local expected_owner="$4" expected_mode="$5" path="$6" kind="$7"
+  local actual_id actual_type actual_sha_output actual_sha actual_owner actual_mode
+
   if [[ -f "$path" && ! -L "$path" ]]; then
-    :
-  elif [[ -L "$path" && "$(/usr/bin/readlink "$path")" == /dev/null ]]; then
-    :
+    actual_type=file
+  elif [[ "$kind" == unit && -L "$path" &&
+    "$(/usr/bin/readlink "$path")" == /dev/null ]]; then
+    actual_type=mask
   else
     return 1
   fi
-  same_path_inode "$expected" "$path"
+  [[ "$actual_type" == "$expected_type" ]] || return 1
+  if [[ "$kind" == updater ]]; then
+    [[ -x "$path" ]] || return 1
+  fi
+  actual_id="$("$STAT" -c '%d:%i' -- "$path")" || return 1
+  actual_owner="$("$STAT" -c %u -- "$path")" || return 1
+  actual_mode="$("$STAT" -c %a -- "$path")" || return 1
+  actual_sha_output="$("$SHA256" "$path")" || return 1
+  actual_sha="${actual_sha_output%% *}"
+  [[ "$actual_id" == "$expected_id" && "$actual_owner" == "$expected_owner" &&
+    "$actual_mode" == "$expected_mode" && "$actual_sha" == "$expected_sha" &&
+    "$actual_sha" =~ ^[0-9a-f]{64}$ ]]
+}
+
+safe_unit_with_id() {
+  local expected="$1" path="$2"
+  case "$expected" in
+    "$EXPECTED_UNIT_ID")
+      safe_material_with_metadata "$expected" "$EXPECTED_UNIT_TYPE" \
+        "$EXPECTED_UNIT_SHA256" "$EXPECTED_UNIT_OWNER" "$EXPECTED_UNIT_MODE" \
+        "$path" unit
+      ;;
+    "$EXPECTED_WORK_UNIT_ID")
+      safe_material_with_metadata "$expected" "$EXPECTED_WORK_UNIT_TYPE" \
+        "$EXPECTED_WORK_UNIT_SHA256" "$EXPECTED_WORK_UNIT_OWNER" \
+        "$EXPECTED_WORK_UNIT_MODE" "$path" unit
+      ;;
+    "$EXPECTED_SERVICE_ID")
+      safe_material_with_metadata "$expected" "$EXPECTED_SERVICE_TYPE" \
+        "$EXPECTED_SERVICE_SHA256" "$EXPECTED_SERVICE_OWNER" \
+        "$EXPECTED_SERVICE_MODE" "$path" unit
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 safe_updater_with_id() {
   local expected="$1" path="$2"
-  [[ -f "$path" && ! -L "$path" && -x "$path" ]] || return 1
-  same_followed_inode "$expected" "$path"
+  case "$expected" in
+    "$EXPECTED_RECOVERY_UPDATER_ID")
+      safe_material_with_metadata "$expected" "$EXPECTED_RECOVERY_UPDATER_TYPE" \
+        "$EXPECTED_RECOVERY_UPDATER_SHA256" "$EXPECTED_RECOVERY_UPDATER_OWNER" \
+        "$EXPECTED_RECOVERY_UPDATER_MODE" "$path" updater
+      ;;
+    "$EXPECTED_WORK_UPDATER_ID")
+      safe_material_with_metadata "$expected" "$EXPECTED_WORK_UPDATER_TYPE" \
+        "$EXPECTED_WORK_UPDATER_SHA256" "$EXPECTED_WORK_UPDATER_OWNER" \
+        "$EXPECTED_WORK_UPDATER_MODE" "$path" updater
+      ;;
+    "$EXPECTED_UPDATER_ID")
+      safe_material_with_metadata "$expected" "$EXPECTED_UPDATER_TYPE" \
+        "$EXPECTED_UPDATER_SHA256" "$EXPECTED_UPDATER_OWNER" \
+        "$EXPECTED_UPDATER_MODE" "$path" updater
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 safe_regular_with_id() {
@@ -585,10 +1264,20 @@ validate_build_scene() {
 }
 
 validate_required_materials() {
-  safe_unit_with_id "$EXPECTED_UNIT_ID" "$RECOVERY_UNIT" ||
-    die '旧 unit 恢复材料已变化'
-  safe_updater_with_id "$EXPECTED_RECOVERY_UPDATER_ID" "$RECOVERY_UPDATER" ||
-    die '旧 updater 恢复材料已变化'
+  if [[ "$UNIT_EXISTED" == 1 ]]; then
+    safe_unit_with_id "$EXPECTED_UNIT_ID" "$RECOVERY_UNIT" ||
+      die '旧 unit 恢复材料已变化'
+  else
+    is_absent "$RECOVERY_UNIT" && is_absent "$RECOVERY_WORK_UNIT" ||
+      die '原本不存在 unit，却检测到伪造的旧 unit 恢复材料'
+  fi
+  if [[ "$UPDATER_EXISTED" == 1 ]]; then
+    safe_updater_with_id "$EXPECTED_RECOVERY_UPDATER_ID" "$RECOVERY_UPDATER" ||
+      die '旧 updater 恢复材料已变化'
+  else
+    is_absent "$RECOVERY_UPDATER" && is_absent "$RECOVERY_WORK_UPDATER" ||
+      die '原本不存在 updater，却检测到伪造的旧 updater 恢复材料'
+  fi
   safe_regular_with_id "$EXPECTED_ENABLE_ID" "$RECOVERY_ENABLE_STATE" ||
     die 'enable 状态恢复材料已变化'
   [[ "$(<"$RECOVERY_ENABLE_STATE")" == "$EXPECTED_ENABLE_STATE" ]] ||
@@ -598,11 +1287,17 @@ validate_required_materials() {
 }
 
 validate_cleanup_material_or_absent() {
-  if ! is_absent "$RECOVERY_UNIT"; then
+  if [[ "$UNIT_EXISTED" == 0 ]]; then
+    is_absent "$RECOVERY_UNIT" && is_absent "$RECOVERY_WORK_UNIT" ||
+      die '原本不存在 unit，清理阶段却出现旧 unit 材料'
+  elif ! is_absent "$RECOVERY_UNIT"; then
     safe_unit_with_id "$EXPECTED_UNIT_ID" "$RECOVERY_UNIT" ||
       die '旧 unit 恢复材料处于不确定现场'
   fi
-  if ! is_absent "$RECOVERY_UPDATER"; then
+  if [[ "$UPDATER_EXISTED" == 0 ]]; then
+    is_absent "$RECOVERY_UPDATER" && is_absent "$RECOVERY_WORK_UPDATER" ||
+      die '原本不存在 updater，清理阶段却出现旧 updater 材料'
+  elif ! is_absent "$RECOVERY_UPDATER"; then
     safe_updater_with_id "$EXPECTED_RECOVERY_UPDATER_ID" "$RECOVERY_UPDATER" ||
       die '旧 updater 恢复材料处于不确定现场'
   fi
@@ -654,26 +1349,66 @@ root_scene() {
 }
 
 unit_scene() {
-  if safe_unit_with_id "$EXPECTED_SERVICE_ID" "$SERVICE_TARGET" &&
-    safe_unit_with_id "$EXPECTED_WORK_UNIT_ID" "$RECOVERY_WORK_UNIT"; then
+  if [[ "$UNIT_EXISTED" == 1 ]]; then
+    if safe_unit_with_id "$EXPECTED_SERVICE_ID" "$SERVICE_TARGET" &&
+      safe_unit_with_id "$EXPECTED_WORK_UNIT_ID" "$RECOVERY_WORK_UNIT"; then
+      printf 'new_unit\n'
+    elif safe_unit_with_id "$EXPECTED_WORK_UNIT_ID" "$SERVICE_TARGET" &&
+      is_absent "$RECOVERY_WORK_UNIT"; then
+      printf 'old_unit\n'
+    else
+      return 1
+    fi
+  elif safe_unit_with_id "$EXPECTED_SERVICE_ID" "$SERVICE_TARGET" &&
+    is_absent "$RECOVERY_WORK_UNIT" && is_absent "$RECOVERY_UNIT"; then
     printf 'new_unit\n'
-  elif safe_unit_with_id "$EXPECTED_WORK_UNIT_ID" "$SERVICE_TARGET" &&
-    is_absent "$RECOVERY_WORK_UNIT"; then
-    printf 'old_unit\n'
+  elif is_absent "$SERVICE_TARGET" && is_absent "$RECOVERY_WORK_UNIT" &&
+    is_absent "$RECOVERY_UNIT"; then
+    printf 'unit_absent\n'
   else
     return 1
   fi
 }
 
 updater_scene() {
-  if safe_updater_with_id "$EXPECTED_UPDATER_ID" "$UPDATER_TARGET" &&
-    safe_updater_with_id "$EXPECTED_WORK_UPDATER_ID" "$RECOVERY_WORK_UPDATER"; then
+  if [[ "$UPDATER_EXISTED" == 1 ]]; then
+    if safe_updater_with_id "$EXPECTED_UPDATER_ID" "$UPDATER_TARGET" &&
+      safe_updater_with_id "$EXPECTED_WORK_UPDATER_ID" "$RECOVERY_WORK_UPDATER"; then
+      printf 'new_updater\n'
+    elif safe_updater_with_id "$EXPECTED_WORK_UPDATER_ID" "$UPDATER_TARGET" &&
+      is_absent "$RECOVERY_WORK_UPDATER"; then
+      printf 'old_updater\n'
+    else
+      return 1
+    fi
+  elif safe_updater_with_id "$EXPECTED_UPDATER_ID" "$UPDATER_TARGET" &&
+    is_absent "$RECOVERY_WORK_UPDATER" && is_absent "$RECOVERY_UPDATER"; then
     printf 'new_updater\n'
-  elif safe_updater_with_id "$EXPECTED_WORK_UPDATER_ID" "$UPDATER_TARGET" &&
-    is_absent "$RECOVERY_WORK_UPDATER"; then
-    printf 'old_updater\n'
+  elif is_absent "$UPDATER_TARGET" && is_absent "$RECOVERY_WORK_UPDATER" &&
+    is_absent "$RECOVERY_UPDATER"; then
+    printf 'updater_absent\n'
   else
     return 1
+  fi
+}
+
+unit_is_restored() {
+  local scene
+  scene="$(unit_scene)" || return 1
+  if [[ "$UNIT_EXISTED" == 1 ]]; then
+    [[ "$scene" == old_unit ]]
+  else
+    [[ "$scene" == unit_absent ]]
+  fi
+}
+
+updater_is_restored() {
+  local scene
+  scene="$(updater_scene)" || return 1
+  if [[ "$UPDATER_EXISTED" == 1 ]]; then
+    [[ "$scene" == old_updater ]]
+  else
+    [[ "$scene" == updater_absent ]]
   fi
 }
 
@@ -690,6 +1425,25 @@ ensure_stopped() {
     die '无法确认 9Router 已停止；恢复未修改下一项现场'
 }
 
+ensure_stopped_or_missing() {
+  local active_state active_status
+  if [[ "$UNIT_EXISTED" == 1 || -e "$SERVICE_TARGET" || -L "$SERVICE_TARGET" ]]; then
+    ensure_stopped
+    return
+  fi
+  if active_state="$("$SYSTEMCTL" is-active 9router 2>/dev/null)"; then
+    die '缺失 unit 的服务却仍处于 active；联合恢复未修改下一项现场'
+  else
+    active_status=$?
+  fi
+  if [[ "$active_status" -eq 4 && "$active_state" == unknown ]]; then
+    return 0
+  fi
+  [[ "$active_status" -eq 3 &&
+    ( "$active_state" == inactive || "$active_state" == failed ) ]] ||
+    die '无法确认缺失 unit 的服务已经停止'
+}
+
 validate_restored_systemd_state() {
   local enable_state enable_status active_state active_status
 
@@ -703,9 +1457,14 @@ validate_restored_systemd_state() {
       [[ "$enable_status" -eq 0 && "$enable_state" == enabled ]] ||
         die '恢复后的 enable 状态不是 enabled'
       ;;
-    disabled|not-found)
+    disabled)
       [[ "$enable_status" -eq 1 && "$enable_state" == disabled ]] ||
         die '恢复后的 enable 状态不是 disabled'
+      ;;
+    not-found)
+      [[ ( "$enable_status" -eq 1 || "$enable_status" -eq 4 ) &&
+        "$enable_state" == not-found ]] ||
+        die '恢复后的 enable 状态不是 not-found'
       ;;
     masked)
       [[ "$enable_status" -eq 1 && "$enable_state" == masked ]] ||
@@ -723,9 +1482,14 @@ validate_restored_systemd_state() {
     else
       active_status=$?
     fi
-    [[ "$active_status" -eq 3 &&
-      ( "$active_state" == inactive || "$active_state" == failed ) ]] ||
-      die '恢复后的原服务运行状态无法确认'
+    if [[ "$EXPECTED_ENABLE_STATE" == not-found ]]; then
+      [[ "$active_status" -eq 4 && "$active_state" == unknown ]] ||
+        die '恢复后的缺失服务运行状态无法确认'
+    else
+      [[ "$active_status" -eq 3 &&
+        ( "$active_state" == inactive || "$active_state" == failed ) ]] ||
+        die '恢复后的原服务运行状态无法确认'
+    fi
   fi
 }
 
@@ -733,13 +1497,14 @@ restore_systemd_state() {
   "$SYSTEMCTL" daemon-reload || die 'systemd daemon-reload 失败；请重试同一恢复脚本'
   case "$EXPECTED_ENABLE_STATE" in
     enabled) "$SYSTEMCTL" enable 9router || die '恢复 enabled 状态失败' ;;
-    disabled|not-found) "$SYSTEMCTL" disable 9router || die '恢复 disabled 状态失败' ;;
+    disabled) "$SYSTEMCTL" disable 9router || die '恢复 disabled 状态失败' ;;
+    not-found) : ;;
     masked) "$SYSTEMCTL" mask 9router || die '恢复 masked 状态失败' ;;
     *) die '恢复脚本中的 enable 状态无效' ;;
   esac
   if [[ "$EXPECTED_SERVICE_WAS_ACTIVE" == 1 ]]; then
     "$SYSTEMCTL" start 9router || die '重新启动原 9Router 服务失败'
-  else
+  elif [[ "$EXPECTED_ENABLE_STATE" != not-found ]]; then
     ensure_stopped
   fi
   validate_restored_systemd_state
@@ -783,8 +1548,8 @@ validate_final_scene() {
   validate_build_scene
   scene="$(root_scene)" || return 1
   [[ "$scene" == old_restored ]] || return 1
-  [[ "$(unit_scene)" == old_unit ]] || return 1
-  [[ "$(updater_scene)" == old_updater ]] || return 1
+  unit_is_restored || return 1
+  updater_is_restored || return 1
   is_absent "$RECOVERY_UNIT" && is_absent "$RECOVERY_UPDATER" &&
     is_absent "$RECOVERY_ENABLE_STATE" && is_absent "$PHASE_FILE"
 }
@@ -814,7 +1579,7 @@ remove_checked_regular_material() {
 }
 
 [[ "$TEST_MODE" == 1 || "$EUID" -eq 0 ]] || die '恢复脚本必须以 root 身份运行'
-for command_path in "$SYSTEMCTL" "$FLOCK" "$STAT" "$MV" "$RM"; do
+for command_path in "$SYSTEMCTL" "$FLOCK" "$STAT" "$SHA256" "$MV" "$RM"; do
   [[ -x "$command_path" ]] || die "恢复所需命令不可执行：$command_path"
 done
 [[ -f "$SCRIPT_PATH" && ! -L "$SCRIPT_PATH" && -x "$SCRIPT_PATH" ]] ||
@@ -889,43 +1654,65 @@ if [[ "$stage" == root_restored ]]; then
   unit_state="$(unit_scene)" || die 'unit 恢复现场不确定'
   [[ "$(updater_scene)" == new_updater ]] || die 'updater 在 unit 恢复前已变化'
   if [[ "$unit_state" == new_unit ]]; then
-    if ! "$MV" -fT -- "$RECOVERY_WORK_UNIT" "$SERVICE_TARGET"; then
-      if safe_unit_with_id "$EXPECTED_WORK_UNIT_ID" "$SERVICE_TARGET" &&
-        is_absent "$RECOVERY_WORK_UNIT"; then
-        die '旧 unit 已恢复，但命令报错；请重试同一恢复脚本'
+    if [[ "$UNIT_EXISTED" == 1 ]]; then
+      if ! "$MV" -fT -- "$RECOVERY_WORK_UNIT" "$SERVICE_TARGET"; then
+        if safe_unit_with_id "$EXPECTED_WORK_UNIT_ID" "$SERVICE_TARGET" &&
+          is_absent "$RECOVERY_WORK_UNIT"; then
+          die '旧 unit 已恢复，但命令报错；请重试同一恢复脚本'
+        fi
+        die '无法安全恢复旧 unit；联合恢复已停止'
       fi
-      die '无法安全恢复旧 unit；联合恢复已停止'
+    else
+      case "$EXPECTED_ENABLE_STATE" in
+        disabled|not-found)
+          "$SYSTEMCTL" disable 9router ||
+            die '移除本次新增 unit 前无法清理 enable 链接'
+          ;;
+      esac
+      if ! "$RM" -f -- "$SERVICE_TARGET"; then
+        if is_absent "$SERVICE_TARGET"; then
+          die '本次新增 unit 已移除，但命令报错；请重试同一恢复脚本'
+        fi
+        die '无法安全移除本次新增 unit；联合恢复已停止'
+      fi
     fi
   fi
-  [[ "$(unit_scene)" == old_unit ]] || die '旧 unit 恢复后现场验证失败'
+  unit_is_restored || die 'unit 恢复后现场验证失败'
   write_stage unit_restored
   stage=unit_restored
 fi
 
 if [[ "$stage" == unit_restored ]]; then
   validate_restored_root
-  [[ "$(unit_scene)" == old_unit ]] || die '已恢复 unit 现场发生变化'
-  ensure_stopped
+  unit_is_restored || die '已恢复 unit 现场发生变化'
+  ensure_stopped_or_missing
   updater_state="$(updater_scene)" || die 'updater 恢复现场不确定'
   if [[ "$updater_state" == new_updater ]]; then
-    if ! "$MV" -fT -- "$RECOVERY_WORK_UPDATER" "$UPDATER_TARGET"; then
-      if safe_updater_with_id "$EXPECTED_WORK_UPDATER_ID" "$UPDATER_TARGET" &&
-        is_absent "$RECOVERY_WORK_UPDATER"; then
-        die '旧 updater 已恢复，但命令报错；请重试同一恢复脚本'
+    if [[ "$UPDATER_EXISTED" == 1 ]]; then
+      if ! "$MV" -fT -- "$RECOVERY_WORK_UPDATER" "$UPDATER_TARGET"; then
+        if safe_updater_with_id "$EXPECTED_WORK_UPDATER_ID" "$UPDATER_TARGET" &&
+          is_absent "$RECOVERY_WORK_UPDATER"; then
+          die '旧 updater 已恢复，但命令报错；请重试同一恢复脚本'
+        fi
+        die '无法安全恢复旧 updater；联合恢复已停止'
       fi
-      die '无法安全恢复旧 updater；联合恢复已停止'
+    elif ! "$RM" -f -- "$UPDATER_TARGET"; then
+      if is_absent "$UPDATER_TARGET"; then
+        die '本次新增 updater 已移除，但命令报错；请重试同一恢复脚本'
+      fi
+      die '无法安全移除本次新增 updater；联合恢复已停止'
     fi
   fi
-  [[ "$(updater_scene)" == old_updater ]] || die '旧 updater 恢复后现场验证失败'
+  updater_is_restored || die 'updater 恢复后现场验证失败'
   write_stage updater_restored
   stage=updater_restored
 fi
 
 if [[ "$stage" == updater_restored ]]; then
   validate_restored_root
-  [[ "$(unit_scene)" == old_unit ]] || die '已恢复 unit 现场发生变化'
-  [[ "$(updater_scene)" == old_updater ]] || die '已恢复 updater 现场发生变化'
-  ensure_stopped
+  unit_is_restored || die '已恢复 unit 现场发生变化'
+  updater_is_restored || die '已恢复 updater 现场发生变化'
+  ensure_stopped_or_missing
   restore_systemd_state
   write_stage systemd_restored
   stage=systemd_restored
@@ -934,8 +1721,8 @@ fi
 
 if [[ "$stage" == systemd_restored ]]; then
   validate_restored_root
-  [[ "$(unit_scene)" == old_unit ]] || die '已恢复 unit 现场发生变化'
-  [[ "$(updater_scene)" == old_updater ]] || die '已恢复 updater 现场发生变化'
+  unit_is_restored || die '已恢复 unit 现场发生变化'
+  updater_is_restored || die '已恢复 updater 现场发生变化'
   validate_cleanup_material_or_absent
   if [[ "$systemd_state_fresh" -eq 1 ]]; then
     validate_restored_systemd_state
@@ -1419,6 +2206,14 @@ CLEANUP_BODY
 
 
 report_joint_recovery() {
+  if path_is_safe_directory "$PREVIOUS_DIR"; then
+    if write_joint_recovery_script; then
+      printf '人工联合恢复：%s\n' "$RECOVERY_SCRIPT" >&2
+    else
+      printf '联合恢复现场或材料未通过严格验证；未生成脚本，请保留现场并人工核对。\n' >&2
+    fi
+    return 0
+  fi
   if (( UNIT_EXISTED == 0 && UPDATER_EXISTED == 0 &&
     UNIT_BACKUP_READY == 0 && UPDATER_BACKUP_READY == 0 )) &&
     [[ "$ENABLE_STATE" == not-found || "$ENABLE_STATE" == disabled ]]; then
@@ -1429,9 +2224,9 @@ report_joint_recovery() {
     fi
     return 0
   fi
-  if (( UNIT_EXISTED != 1 || UPDATER_EXISTED != 1 ||
-    UNIT_BACKUP_READY != 1 || UPDATER_BACKUP_READY != 1 )); then
-    printf '没有旧 unit 与旧 updater 可供联合恢复；这是首次安装或旧入口材料不完整，不生成联合恢复脚本。\n' >&2
+  if (( UNIT_BACKUP_READY != UNIT_EXISTED ||
+    UPDATER_BACKUP_READY != UPDATER_EXISTED )); then
+    printf '旧 unit/updater 材料状态不完整，不生成联合恢复脚本。\n' >&2
     return 0
   fi
   if ! write_joint_recovery_script; then
@@ -1444,6 +2239,11 @@ report_joint_recovery() {
 preserve_post_switch() {
   TRANSACTION_ACTIVE=0
   cleanup_unready_temps || true
+  if [[ -e "$ENTRYPOINT_STATE" || -L "$ENTRYPOINT_STATE" ]]; then
+    if ! confirm_new_entrypoints; then
+      printf '新 unit/updater 与持久化入口事务不一致；入口状态文件保持原样。\n' >&2
+    fi
+  fi
   printf '9Router 已进入切换后阶段（%s）；未自动回滚，新 unit、新 updater 与部署现场均已保留。\n' \
     "$UPDATER_PHASE" >&2
   report_joint_recovery
@@ -1452,7 +2252,7 @@ preserve_post_switch() {
 on_exit() {
   local exit_code="$?"
 
-  trap - EXIT
+  trap - EXIT INT TERM
   if [[ "$exit_code" -ne 0 && "$TRANSACTION_ACTIVE" -eq 1 ]]; then
     if (( UPDATER_STARTED == 1 )); then
       UPDATER_PHASE="$(read_updater_phase)"
@@ -1493,7 +2293,7 @@ if [[ "$TEST_MODE" == 1 ]]; then
 
   for override in UPDATER_TARGET SERVICE_TARGET DATA_DIR ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE PHASE_FILE RECOVERY_UNIT \
     RECOVERY_UPDATER RECOVERY_ENABLE_STATE RECOVERY_SCRIPT FIRST_INSTALL_CLEANUP_SCRIPT \
-    ENV_FILE SYSTEMCTL NODE NPM GIT CURL FLOCK STAT MKDIR CP MV RM INSTALL; do
+    ENTRYPOINT_STATE ENV_FILE SYSTEMCTL NODE NPM GIT CURL FLOCK STAT SHA256 MKDIR CP MV RM INSTALL; do
     env_name="NINEROUTER_${override}"
     [[ -n "${!env_name+x}" ]] || die "root 测试模式缺少 $env_name"
   done
@@ -1512,6 +2312,7 @@ if [[ "$TEST_MODE" == 1 ]]; then
   RECOVERY_ENABLE_STATE="$NINEROUTER_RECOVERY_ENABLE_STATE"
   RECOVERY_SCRIPT="$NINEROUTER_RECOVERY_SCRIPT"
   FIRST_INSTALL_CLEANUP_SCRIPT="$NINEROUTER_FIRST_INSTALL_CLEANUP_SCRIPT"
+  ENTRYPOINT_STATE="$NINEROUTER_ENTRYPOINT_STATE"
   SYSTEMCTL="$NINEROUTER_SYSTEMCTL"
   NODE="$NINEROUTER_NODE"
   NPM="$NINEROUTER_NPM"
@@ -1519,6 +2320,7 @@ if [[ "$TEST_MODE" == 1 ]]; then
   CURL="$NINEROUTER_CURL"
   FLOCK="$NINEROUTER_FLOCK"
   STAT="$NINEROUTER_STAT"
+  SHA256="$NINEROUTER_SHA256"
   MKDIR="$NINEROUTER_MKDIR"
   CP="$NINEROUTER_CP"
   MV="$NINEROUTER_MV"
@@ -1527,7 +2329,7 @@ if [[ "$TEST_MODE" == 1 ]]; then
 
   for target in DATA_DIR ENV_FILE LOCK_FILE PHASE_FILE RECOVERY_UNIT \
     RECOVERY_UPDATER RECOVERY_ENABLE_STATE RECOVERY_SCRIPT FIRST_INSTALL_CLEANUP_SCRIPT \
-    SYSTEMCTL NODE NPM GIT CURL FLOCK STAT MKDIR CP MV RM INSTALL; do
+    ENTRYPOINT_STATE SYSTEMCTL NODE NPM GIT CURL FLOCK STAT SHA256 MKDIR CP MV RM INSTALL; do
     validate_test_path "$target" "${!target}"
   done
   validate_test_path UPDATER_TARGET "$UPDATER_TARGET" 1
@@ -1541,8 +2343,9 @@ else
     NINEROUTER_ROOT NINEROUTER_BUILD_DIR NINEROUTER_PREVIOUS_DIR \
     NINEROUTER_RECOVERY_UNIT NINEROUTER_RECOVERY_UPDATER NINEROUTER_RECOVERY_ENABLE_STATE \
     NINEROUTER_RECOVERY_SCRIPT NINEROUTER_FIRST_INSTALL_CLEANUP_SCRIPT \
+    NINEROUTER_ENTRYPOINT_STATE \
     NINEROUTER_SYSTEMCTL NINEROUTER_NODE NINEROUTER_NPM NINEROUTER_GIT NINEROUTER_CURL \
-    NINEROUTER_FLOCK NINEROUTER_STAT NINEROUTER_MKDIR NINEROUTER_CP NINEROUTER_MV \
+    NINEROUTER_FLOCK NINEROUTER_STAT NINEROUTER_SHA256 NINEROUTER_MKDIR NINEROUTER_CP NINEROUTER_MV \
     NINEROUTER_RM NINEROUTER_INSTALL; do
     [[ -z "${!override+x}" ]] || die "root 环境拒绝 $override 覆盖"
   done
@@ -1561,6 +2364,7 @@ else
   RECOVERY_ENABLE_STATE=/run/9router-install-recovery.enable-state
   RECOVERY_SCRIPT=/run/9router-install-recover
   FIRST_INSTALL_CLEANUP_SCRIPT=/run/9router-install-cleanup
+  ENTRYPOINT_STATE=/run/9router-install-entrypoints.state
   SYSTEMCTL=/usr/bin/systemctl
   NODE=/opt/node-v24.15.0-npm/node/bin/node
   NPM=/opt/node-v24.15.0-npm/node/bin/npm
@@ -1568,6 +2372,7 @@ else
   CURL=/usr/bin/curl
   FLOCK=/usr/bin/flock
   STAT=/usr/bin/stat
+  SHA256=/usr/bin/sha256sum
   MKDIR=/bin/mkdir
   CP=/bin/cp
   MV=/bin/mv
@@ -1594,6 +2399,7 @@ require_executable git "$GIT"
 require_executable curl "$CURL"
 require_executable flock "$FLOCK"
 require_executable stat "$STAT"
+require_executable sha256sum "$SHA256"
 require_executable systemctl "$SYSTEMCTL"
 require_executable mkdir "$MKDIR"
 require_executable cp "$CP"
@@ -1603,10 +2409,12 @@ require_executable install "$INSTALL"
 
 [[ -f "$SCRIPT_DIR/9router-update" ]] || die '缺少 deploy/linux/9router-update'
 [[ -f "$SCRIPT_DIR/9router.service" ]] || die '缺少 deploy/linux/9router.service'
-validate_protocol_paths
+validate_protocol_paths 1
 
 exec 8>>"$LOCK_FILE"
 "$FLOCK" -n 8 || die '已有 9Router 安装或更新事务正在执行'
+reconcile_entrypoint_transaction ||
+  die '未能安全调和上一次安装入口事务；拒绝执行新的安装'
 validate_protocol_paths
 path_is_absent "$FAILED_ROOT" ||
   die "检测到失败代码检查目录，拒绝改写安装入口；请先检查并移走或清理：$FAILED_ROOT"
@@ -1671,6 +2479,8 @@ fi
 "$MKDIR" -p "${UPDATER_TARGET%/*}" "${SERVICE_TARGET%/*}"
 TRANSACTION_ACTIVE=1
 trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 ENABLE_STATE_TEMP="$(/usr/bin/mktemp "${RECOVERY_ENABLE_STATE}.tmp.XXXXXX")"
 printf '%s\n' "$ENABLE_STATE" >"$ENABLE_STATE_TEMP"
@@ -1678,6 +2488,8 @@ printf '%s\n' "$ENABLE_STATE" >"$ENABLE_STATE_TEMP"
 ENABLE_STATE_TEMP=""
 ENABLE_STATE_READY=1
 
+capture_recorded_material UPDATER_TARGET "$UPDATER_TARGET" updater ||
+  die '无法记录原有 updater 元数据'
 if [[ -e "$UPDATER_TARGET" || -L "$UPDATER_TARGET" ]]; then
   UPDATER_EXISTED=1
   UPDATER_BACKUP_TEMP="$(/usr/bin/mktemp "${RECOVERY_UPDATER}.tmp.XXXXXX")"
@@ -1691,6 +2503,10 @@ if [[ -e "$UPDATER_TARGET" || -L "$UPDATER_TARGET" ]]; then
   UPDATER_BACKUP_TEMP=""
   UPDATER_BACKUP_READY=1
 fi
+capture_recorded_material UPDATER_BACKUP "$RECOVERY_UPDATER" updater ||
+  die '无法记录 updater 恢复材料元数据'
+capture_recorded_material UNIT_TARGET "$SERVICE_TARGET" unit ||
+  die '无法记录原有 unit 元数据'
 if [[ -e "$SERVICE_TARGET" || -L "$SERVICE_TARGET" ]]; then
   UNIT_EXISTED=1
   UNIT_BACKUP_TEMP="$(/usr/bin/mktemp "${RECOVERY_UNIT}.tmp.XXXXXX")"
@@ -1704,18 +2520,34 @@ if [[ -e "$SERVICE_TARGET" || -L "$SERVICE_TARGET" ]]; then
   UNIT_BACKUP_TEMP=""
   UNIT_BACKUP_READY=1
 fi
+capture_recorded_material UNIT_BACKUP "$RECOVERY_UNIT" unit ||
+  die '无法记录 unit 恢复材料元数据'
 
 UPDATER_STAGED="$(/usr/bin/mktemp "${UPDATER_TARGET}.new.XXXXXX")"
 "$INSTALL" -m 0755 "$SCRIPT_DIR/9router-update" "$UPDATER_STAGED"
-UPDATER_DEPLOYED=1
-"$MV" -fT -- "$UPDATER_STAGED" "$UPDATER_TARGET"
-UPDATER_STAGED=""
+capture_recorded_material UPDATER_STAGED "$UPDATER_STAGED" updater ||
+  die '无法记录 staged updater 元数据'
 
 UNIT_STAGED="$(/usr/bin/mktemp "${SERVICE_TARGET}.new.XXXXXX")"
 "$INSTALL" -m 0644 "$SCRIPT_DIR/9router.service" "$UNIT_STAGED"
+capture_recorded_material UNIT_STAGED "$UNIT_STAGED" unit ||
+  die '无法记录 staged unit 元数据'
+
+write_entrypoint_state updater_intent || die '无法持久化 updater 入口移动 intent'
+UPDATER_DEPLOYED=1
+"$MV" -fT -- "$UPDATER_STAGED" "$UPDATER_TARGET"
+material_matches_record UPDATER_STAGED "$UPDATER_TARGET" updater &&
+  [[ ! -e "$UPDATER_STAGED" && ! -L "$UPDATER_STAGED" ]] ||
+  die 'updater 入口移动后的现场核验失败'
+write_entrypoint_state updater_committed || die '无法提交 updater 入口移动状态'
+
+write_entrypoint_state unit_intent || die '无法持久化 unit 入口移动 intent'
 UNIT_DEPLOYED=1
 "$MV" -fT -- "$UNIT_STAGED" "$SERVICE_TARGET"
-UNIT_STAGED=""
+material_matches_record UNIT_STAGED "$SERVICE_TARGET" unit &&
+  [[ ! -e "$UNIT_STAGED" && ! -L "$UNIT_STAGED" ]] ||
+  die 'unit 入口移动后的现场核验失败'
+write_entrypoint_state unit_committed || die '无法提交 unit 入口移动状态'
 
 "$MKDIR" -p "$DATA_DIR"
 "$SYSTEMCTL" daemon-reload
@@ -1726,6 +2558,7 @@ UPDATER_STARTED=1
 NINEROUTER_INHERITED_LOCK_FD=8 "$UPDATER_TARGET"
 UPDATER_PHASE="$(read_updater_phase)"
 [[ "$UPDATER_PHASE" == healthy ]] || die "更新器成功返回但阶段不是 healthy：$UPDATER_PHASE"
+confirm_new_entrypoints || die '更新成功但新 unit/updater 入口提交核验失败'
 UPDATER_STARTED=0
 TRANSACTION_ACTIVE=0
 

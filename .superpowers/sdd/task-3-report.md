@@ -311,3 +311,54 @@ PASS: 9router Linux updater tests
 - 安装入口部署标志在原子 mv 前建立，使 TERM/失败 trap 能覆盖“mv 已发生但下一条赋值尚未执行”的窗口。
 
 验证：三脚本 `bash -n`；完整 `bash deploy/linux/test-9router-update.sh` 退出 0 并打印 PASS；`npm exec -- eslint src/app/api/auth/login/route.js`；`npm ci --dry-run --ignore-scripts`；`git diff --check`，均通过。
+
+## 2026-08-12 安装入口恢复矩阵收口
+
+本轮仅收口安装入口恢复协议的 A/B/C，不扩大直接部署范围。
+
+### A：入口移动 intent/committed
+
+- updater 与 unit 均在移动前原子持久化 `*_intent`，移动、SHA-256/元数据现场核验后再持久化 `*_committed`。
+- 状态文件绑定 `unit_existed`、`updater_existed`，以及 staged/target/backup 的 inode、类型、SHA-256、owner、mode；启动时只对严格匹配的现场恢复或提交。
+- SIGKILL 后重启调和、命令返回失败但移动已发生、SIGTERM 三类回归均实际恢复旧入口并清理固定材料。
+
+### B：四象限联合恢复
+
+- `both`、`unit-only`、`updater-only`、`neither` 四种 `UNIT_EXISTED`/`UPDATER_EXISTED` 组合均先制造 post-switch 健康失败，再要求生成可执行固定恢复脚本。
+- 每个象限都实际运行脚本至终态：旧 runtime 恢复，新失败代码转存到 `.failed`；原本存在的 unit/updater 恢复原字节并可执行，原本不存在的入口被移除。
+- 最终 readback 覆盖 enabled/disabled/not-found 与 active/inactive/unknown 语义，并断言 unit、updater、work、enable-state、phase、step、script 全部按状态机消费。
+
+### C：不可变恢复材料
+
+- 生成期分别对固定 unit/updater 恢复材料做同 inode 内容篡改；SHA-256 复验拒绝生成 script/step，篡改材料与新入口均保留。
+- 执行期分别篡改 fixed-unit、fixed-updater、work-unit、work-updater；恢复脚本在任何 runtime 或入口破坏性动作前复验 inode、类型、SHA-256、owner、mode，失败后脚本和被篡改材料均保持不变。
+- work 副本生成后先与固定材料摘要/类型/owner/mode 对账，生成脚本前再次复验 fixed 材料，消除 copy 与发布之间的静默内容变化。
+
+### 接管与验证证据
+
+本次接管保留前一执行者留下的两个未提交文件。接管时实现与新增回归已经存在，因此不把首次执行的绿灯虚构为本轮 RED；历史 RED 证据仍以上文各轮记录为准。本轮增加显式聚焦入口并取得新鲜证据：
+
+```text
+$ NINEROUTER_TEST_FOCUS_INSTALLER_RECOVERY=1 bash deploy/linux/test-9router-update.sh
+PASS: focused installer recovery tests
+
+$ bash deploy/linux/test-9router-update.sh
+PASS: 9router Linux updater tests
+```
+
+两条命令均直接退出 0；默认完整套件未重定向或筛选 PASS。测试输出中的四条 `Killed: 9` 来自 A 的预期 SIGKILL 故障注入，套件随后继续并到达 PASS。
+
+### absent-unit 调和 P1 修复
+
+独立审查发现 A 原先只用 unit/updater 都存在的 legacy 现场：原 unit 不存在时，调和先删除新 unit，随后 `not-found` 分支仍对缺失 unit 执行 `systemctl disable`。真实 missing-unit 语义会让该命令失败并保留 entrypoint/enable 状态，后续安装永久重复失败。
+
+先增加 `neither` 现场下 updater/unit 两个入口移动后 SIGKILL 的回归，并用 realistic missing-unit 重启安装器。旧实现稳定红灯：
+
+```text
+未能安全调和上一次安装入口事务；拒绝执行新的安装
+FAIL: installer could not reconcile originally absent entrypoints and retry
+```
+
+最小修复在新 unit 仍存在时先清理 enable 链接，再按记录删除入口；若 unit 已 absent，则只可能是尚未安装或上一次已完成前置清理，`not-found` 终态不再向缺失 unit 重发 disable。两条回归均要求第二次安装不仅完成调和，还完整成功安装、比对新 unit/updater，并清空所有固定材料。
+
+修复后聚焦套件与完整套件均 exit 0；原审查者再次只读复核，结论为 `No findings（P0/P1/P2）`，确认该回归不是假绿。

@@ -75,3 +75,19 @@ The parent task will record the final three syntax checks and `git diff --check`
 ## 2026-08-11 直接部署运行时闭包
 
 固定 Node 直接执行 npm CLI，lifecycle PATH 仅含固定 Node、`/usr/bin`、`/bin`；运行时新增 `src/shared/constants/mitmToolHosts.js` 并在切换前对 DNS 配置执行隔离 require smoke。健康检查绕过环境代理，previous 采用 retired 两阶段清理。完整 Linux 集成 PASS，npm dry-run 通过。
+
+## 2026-08-12 安装入口恢复矩阵最终验证
+
+状态：**DONE**。独立只读审查发现的 absent-unit 调和 P1 已按 RED→GREEN 修复；复核结论为 `No findings（P0/P1/P2）`。
+
+| 验证 | 结果 |
+| --- | --- |
+| `bash -n deploy/linux/9router-update deploy/linux/install.sh deploy/linux/test-9router-update.sh` | PASS，exit 0 |
+| `NINEROUTER_TEST_FOCUS_INSTALLER_RECOVERY=1 bash deploy/linux/test-9router-update.sh` | PASS，直接打印 focused PASS，exit 0 |
+| `bash deploy/linux/test-9router-update.sh` | PASS，直接打印完整套件 PASS，exit 0 |
+| `npm ci --dry-run --ignore-scripts` | PASS，exit 0，报告 would add 77 packages |
+| `git diff --check` | PASS，exit 0 |
+
+聚焦测试真实执行 A 的 SIGKILL/重启调和、B 的四个存在性象限及恢复脚本终态、C 的生成期 fixed 和执行期 fixed/work 同 inode 篡改拒绝；不是仅对生成文本做 grep。完整测试保持默认行为，显式聚焦环境变量未设置时不会跳过其他集成场景。
+
+独立审查首次指出 originally absent unit 会在删除后重复执行 `disable`，导致恢复状态永久残留。新增 updater/unit 两个 SIGKILL 回归先在旧实现上稳定失败；修复将 enable-link 清理前移到 unit 仍存在时。修复后的聚焦套件、完整套件和独立复核全部通过，无已知功能缺陷。

@@ -44,6 +44,10 @@ file_mode() {
   stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
 }
 
+file_inode() {
+  stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1"
+}
+
 assert_event_log() {
   local expected
   local actual
@@ -221,7 +225,21 @@ fi
 if /usr/bin/stat -c "$format" -- "$path" 2>/dev/null; then
   exit
 fi
+if [[ "$format" == %a ]]; then
+  format=%Lp
+fi
 exec /usr/bin/stat -f "$format" "$path"
+EOF
+
+  cat >"$TMP/bin/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+if [[ -x /usr/bin/sha256sum ]]; then
+  exec /usr/bin/sha256sum "$@"
+elif [[ -x /sbin/sha256sum ]]; then
+  exec /sbin/sha256sum "$@"
+fi
+exec /usr/bin/shasum -a 256 "$@"
 EOF
 
 cat >"$TMP/bin/node" <<'EOF'
@@ -395,7 +413,19 @@ case "${NINEROUTER_TEST_CURL_MODE:-success}" in
   success) printf '200 \n' ;;
   login-redirect) printf '302 http://127.0.0.1/login\n' ;;
   bad-redirect) printf '302 https://example.invalid/not-login\n' ;;
-  fail) exit 22 ;;
+  fail)
+    case "${NINEROUTER_TEST_TAMPER_RECOVERY_ON_CURL:-}" in
+      unit) tamper_path="$NINEROUTER_RECOVERY_UNIT" ;;
+      updater) tamper_path="$NINEROUTER_RECOVERY_UPDATER" ;;
+      '') exit 22 ;;
+      *) exit 65 ;;
+    esac
+    "$NINEROUTER_STAT" -c '%d:%i' -- "$tamper_path" \
+      >"$NINEROUTER_TEST_TAMPER_INODE_FILE"
+    printf 'same-inode-generator-tamper-%s\n' \
+      "$NINEROUTER_TEST_TAMPER_RECOVERY_ON_CURL" >"$tamper_path"
+    exit 22
+    ;;
   *)
     echo "unexpected curl mode: ${NINEROUTER_TEST_CURL_MODE}" >&2
     exit 64
@@ -510,6 +540,26 @@ if [[ -e "$destination_path" || -L "$destination_path" ]]; then
 else
   /bin/mv "$source_path" "$destination_path"
 fi
+entrypoint_kind=""
+if [[ "$source_path" == *.new.* && -n "${NINEROUTER_UPDATER_TARGET:-}" &&
+  "$destination_path" == "$NINEROUTER_UPDATER_TARGET" ]]; then
+  entrypoint_kind=updater
+elif [[ "$source_path" == *.new.* && -n "${NINEROUTER_SERVICE_TARGET:-}" &&
+  "$destination_path" == "$NINEROUTER_SERVICE_TARGET" ]]; then
+  entrypoint_kind=unit
+fi
+if [[ -n "$entrypoint_kind" &&
+  "${NINEROUTER_TEST_FAIL_ENTRYPOINT_MOVE_AFTER_MUTATION:-}" == "$entrypoint_kind" ]]; then
+  exit 89
+fi
+if [[ -n "$entrypoint_kind" &&
+  "${NINEROUTER_TEST_SIGNAL_AFTER_ENTRYPOINT_MOVE:-}" == "$entrypoint_kind" ]]; then
+  case "${NINEROUTER_TEST_ENTRYPOINT_SIGNAL:-KILL}" in
+    KILL) kill -KILL "$PPID" ;;
+    TERM) kill -TERM "$PPID" ;;
+    *) exit 90 ;;
+  esac
+fi
 EOF
 
   cat >"$TMP/bin/rm" <<'EOF'
@@ -566,6 +616,7 @@ EOF
   done
 
   chmod +x "$TMP/bin/git" "$TMP/bin/flock" "$TMP/bin/npm" "$TMP/bin/node" "$TMP/bin/stat" \
+    "$TMP/bin/sha256sum" \
     "$TMP/bin/mv" "$TMP/bin/systemctl" "$TMP/bin/curl" "$TMP/bin/sleep" \
     "$TMP/bin/mkdir" "$TMP/bin/rm" "$TMP/bin/cp" "$TMP/bin/install"
 }
@@ -585,6 +636,7 @@ run_updater() {
     NINEROUTER_GIT="$TMP/bin/git" \
     NINEROUTER_MV="$TMP/bin/mv" \
     NINEROUTER_STAT="$TMP/bin/stat" \
+    NINEROUTER_SHA256="$TMP/bin/sha256sum" \
     NINEROUTER_FLOCK="$TMP/bin/flock" \
     NINEROUTER_SLEEP="$TMP/bin/sleep" \
     NINEROUTER_MKDIR="$TMP/bin/mkdir" \
@@ -653,8 +705,10 @@ run_installer() {
     NINEROUTER_RECOVERY_ENABLE_STATE="$TMP/run/9router-install-recovery.enable-state" \
     NINEROUTER_RECOVERY_SCRIPT="$TMP/run/9router-install-recover" \
     NINEROUTER_FIRST_INSTALL_CLEANUP_SCRIPT="$TMP/run/9router-install-cleanup" \
+    NINEROUTER_ENTRYPOINT_STATE="$TMP/run/9router-install-entrypoints.state" \
     NINEROUTER_MV="$TMP/bin/mv" \
     NINEROUTER_STAT="$TMP/bin/stat" \
+    NINEROUTER_SHA256="$TMP/bin/sha256sum" \
     NINEROUTER_SLEEP="$TMP/bin/sleep" \
     NINEROUTER_RM="$TMP/bin/rm" \
     NINEROUTER_CP="$TMP/bin/cp" \
@@ -779,6 +833,7 @@ assert_no_fixed_recovery_materials() {
   assert_not_exists "$TMP/run/9router-install-cleanup.step"
   assert_not_exists "$TMP/run/9router-install-recovery.unit.work"
   assert_not_exists "$TMP/run/9router-install-recovery.updater.work"
+  assert_not_exists "$TMP/run/9router-install-entrypoints.state"
 }
 
 assert_old_unit_restored() {
@@ -796,6 +851,131 @@ assert_old_unit_restored() {
   grep -Fqx 'enabled' "$TMP/systemctl.enabled" ||
     fail 'installer did not restore the previous enabled state'
   assert_file "$TMP/systemctl.wants-link"
+}
+
+assert_entrypoint_intent_metadata() {
+  local entrypoint="$1"
+  local component
+  local field
+  local state="$TMP/run/9router-install-entrypoints.state"
+
+  assert_file "$state"
+  grep -Fqx 'version=1' "$state" || fail 'entrypoint intent state has no version'
+  grep -Fqx "phase=${entrypoint}_intent" "$state" ||
+    fail "entrypoint state did not retain ${entrypoint}_intent"
+  for component in staged target backup; do
+    for field in inode type sha256; do
+      grep -Eq "^${entrypoint}_${component}_${field}=.+$" "$state" ||
+        fail "entrypoint intent omitted ${entrypoint}_${component}_${field}"
+    done
+  done
+  grep -Eq "^${entrypoint}_existed=[01]$" "$state" ||
+    fail "entrypoint intent omitted ${entrypoint}_existed"
+}
+
+test_installer_persists_and_reconciles_entrypoint_move_intents() {
+  local entrypoint
+  local termination
+
+  for entrypoint in updater unit; do
+    new_install_tmp
+    make_fakes
+    prepare_legacy_installation
+    if run_installer "$TMP/output-${entrypoint}-kill" env \
+      NINEROUTER_TEST_SIGNAL_AFTER_ENTRYPOINT_MOVE="$entrypoint" \
+      NINEROUTER_TEST_ENTRYPOINT_SIGNAL=KILL; then
+      fail "installer survived SIGKILL after the $entrypoint entrypoint move"
+    fi
+    if [[ ! -f "$TMP/run/9router-install-entrypoints.state" ]]; then
+      sed -n '1,160p' "$TMP/output-${entrypoint}-kill" >&2
+    fi
+    assert_entrypoint_intent_metadata "$entrypoint"
+    if run_installer "$TMP/output-${entrypoint}-startup-reconcile" env \
+      NINEROUTER_TEST_IS_ENABLED_QUERY_ERROR=1; then
+      fail 'installer continued after the post-reconciliation query failure'
+    fi
+    assert_old_unit_restored
+    assert_old_updater_restored
+    if [[ -e "$TMP/run/9router-install-recovery.enable-state" ]]; then
+      sed -n '1,200p' "$TMP/output-${entrypoint}-startup-reconcile" >&2
+    fi
+    assert_no_fixed_recovery_materials
+    cleanup
+    TMP=""
+  done
+
+  for termination in exit TERM; do
+    for entrypoint in updater unit; do
+      new_install_tmp
+      make_fakes
+      prepare_legacy_installation
+      if [[ "$termination" == exit ]]; then
+        if run_installer "$TMP/output-${entrypoint}-${termination}" env \
+          NINEROUTER_TEST_FAIL_ENTRYPOINT_MOVE_AFTER_MUTATION="$entrypoint"; then
+          fail "installer ignored the failed $entrypoint move"
+        fi
+      else
+        if run_installer "$TMP/output-${entrypoint}-${termination}" env \
+          NINEROUTER_TEST_SIGNAL_AFTER_ENTRYPOINT_MOVE="$entrypoint" \
+          NINEROUTER_TEST_ENTRYPOINT_SIGNAL=TERM; then
+          fail "installer survived SIGTERM after the $entrypoint move"
+        fi
+      fi
+      assert_old_unit_restored
+      assert_old_updater_restored
+      if [[ -e "$TMP/run/9router-install-recovery.enable-state" ||
+        -e "$TMP/run/9router-install-entrypoints.state" ]]; then
+        sed -n '1,200p' "$TMP/output-${entrypoint}-${termination}" >&2
+      fi
+      assert_no_fixed_recovery_materials
+      cleanup
+      TMP=""
+    done
+  done
+}
+
+test_installer_reconciles_absent_entrypoints_after_crash() {
+  local entrypoint
+
+  for entrypoint in updater unit; do
+    new_install_tmp
+    make_fakes
+    prepare_recovery_matrix_installation 0 0
+    printf 'not-found\n' >"$TMP/systemctl.enabled"
+    printf 'inactive\n' >"$TMP/systemctl.state"
+    rm -f -- "$TMP/systemctl.wants-link"
+
+    if run_installer "$TMP/output-absent-$entrypoint-kill" env \
+      NINEROUTER_TEST_REALISTIC_MISSING_UNIT=1 \
+      NINEROUTER_TEST_SIGNAL_AFTER_ENTRYPOINT_MOVE="$entrypoint" \
+      NINEROUTER_TEST_ENTRYPOINT_SIGNAL=KILL; then
+      fail "installer survived SIGKILL after moving the first-install $entrypoint"
+    fi
+    assert_entrypoint_intent_metadata "$entrypoint"
+    assert_file "$TMP/usr/local/sbin/9router-update"
+    if [[ "$entrypoint" == updater ]]; then
+      assert_not_exists "$TMP/etc/systemd/system/9router.service"
+    else
+      assert_file "$TMP/etc/systemd/system/9router.service"
+    fi
+
+    if ! run_installer "$TMP/output-absent-$entrypoint-reconcile" env \
+      NINEROUTER_TEST_REALISTIC_MISSING_UNIT=1; then
+      sed -n '1,200p' "$TMP/output-absent-$entrypoint-reconcile" >&2
+      fail "installer could not reconcile originally absent entrypoints after $entrypoint crash"
+    fi
+    cmp "$SERVICE_UNIT" "$TMP/etc/systemd/system/9router.service" ||
+      fail 'retry after absent-entrypoint reconciliation did not install the new unit'
+    cmp "$UPDATER" "$TMP/usr/local/sbin/9router-update" ||
+      fail 'retry after absent-entrypoint reconciliation did not install the new updater'
+    if [[ "$entrypoint" == unit ]]; then
+      grep -Fq 'disable 9router' "$TMP/systemctl.log" ||
+        fail 'reconciliation did not clear enable links before removing the first-install unit'
+    fi
+    assert_no_fixed_recovery_materials
+    cleanup
+    TMP=""
+  done
 }
 
 test_installer_uses_only_test_paths_and_preserves_existing_data() {
@@ -1236,6 +1416,222 @@ test_post_switch_failure_supports_legacy_joint_recovery() {
   TMP=""
 }
 
+prepare_recovery_matrix_installation() {
+  local has_unit="$1"
+  local has_updater="$2"
+
+  mkdir -p "$TMP/opt/9router" "$TMP/root/.9router" \
+    "$TMP/etc/systemd/system" "$TMP/usr/local/sbin"
+  cat >"$TMP/opt/9router/legacy-entrypoint" <<'EOF'
+#!/usr/bin/env bash
+printf 'matrix-legacy-entrypoint-ok\n'
+EOF
+  chmod 0755 "$TMP/opt/9router/legacy-entrypoint"
+  printf 'matrix-old-runtime\n' >"$TMP/opt/9router/current-marker"
+  printf 'matrix-data\n' >"$TMP/root/.9router/existing-data"
+
+  if [[ "$has_unit" == 1 ]]; then
+    printf '[Service]\nExecStart=%s\n' "$TMP/opt/9router/legacy-entrypoint" \
+      >"$TMP/etc/systemd/system/9router.service"
+    chmod 0600 "$TMP/etc/systemd/system/9router.service"
+    cp "$TMP/etc/systemd/system/9router.service" "$TMP/original-unit"
+  fi
+  if [[ "$has_updater" == 1 ]]; then
+    cat >"$TMP/usr/local/sbin/9router-update" <<'EOF'
+#!/usr/bin/env bash
+printf 'matrix-legacy-updater-ok\n'
+EOF
+    chmod 0700 "$TMP/usr/local/sbin/9router-update"
+    cp "$TMP/usr/local/sbin/9router-update" "$TMP/original-updater"
+  fi
+}
+
+test_joint_recovery_covers_all_entrypoint_existence_quadrants() {
+  local quadrant has_unit has_updater expected_enable expected_active
+  local recovery_script legacy_exec legacy_output updater_output
+  local missing_unit_env=""
+  local queried_enable query_status
+
+  for quadrant in both unit-only updater-only neither; do
+    case "$quadrant" in
+      both) has_unit=1; has_updater=1; expected_enable=enabled; expected_active=active ;;
+      unit-only) has_unit=1; has_updater=0; expected_enable=disabled; expected_active=inactive ;;
+      updater-only) has_unit=0; has_updater=1; expected_enable=not-found; expected_active=inactive ;;
+      neither) has_unit=0; has_updater=0; expected_enable=not-found; expected_active=inactive ;;
+    esac
+    new_install_tmp
+    make_fakes
+    prepare_recovery_matrix_installation "$has_unit" "$has_updater"
+    printf '%s\n' "$expected_enable" >"$TMP/systemctl.enabled"
+    printf '%s\n' "$expected_active" >"$TMP/systemctl.state"
+    if [[ "$expected_enable" == enabled ]]; then
+      : >"$TMP/systemctl.wants-link"
+    else
+      rm -f -- "$TMP/systemctl.wants-link"
+    fi
+    if [[ "$has_unit" == 0 ]]; then
+      missing_unit_env=NINEROUTER_TEST_REALISTIC_MISSING_UNIT=1
+    else
+      missing_unit_env=""
+    fi
+    if [[ -n "$missing_unit_env" ]]; then
+      if run_installer "$TMP/output-matrix-$quadrant" env \
+        NINEROUTER_TEST_CURL_MODE=fail "$missing_unit_env"; then
+        fail "$quadrant installer succeeded despite the recovery-matrix health failure"
+      fi
+    elif run_installer "$TMP/output-matrix-$quadrant" env \
+      NINEROUTER_TEST_CURL_MODE=fail; then
+      fail "$quadrant installer succeeded despite the recovery-matrix health failure"
+    fi
+
+    if [[ "$has_unit" == 1 ]]; then
+      assert_file "$TMP/run/9router-install-recovery.unit"
+    else
+      assert_not_exists "$TMP/run/9router-install-recovery.unit"
+      assert_not_exists "$TMP/original-unit"
+    fi
+    if [[ "$has_updater" == 1 ]]; then
+      assert_file "$TMP/run/9router-install-recovery.updater"
+    else
+      assert_not_exists "$TMP/run/9router-install-recovery.updater"
+      assert_not_exists "$TMP/original-updater"
+    fi
+
+    if [[ -x "$TMP/run/9router-install-recover" ]]; then
+      recovery_script="$TMP/run/9router-install-recover"
+    elif [[ -x "$TMP/run/9router-install-cleanup" ]]; then
+      recovery_script="$TMP/run/9router-install-cleanup"
+    else
+      sed -n '1,200p' "$TMP/output-matrix-$quadrant" >&2
+      fail "$quadrant did not generate an executable recovery script"
+    fi
+    if [[ -n "$missing_unit_env" ]]; then
+      run_fixed_script "$TMP/output-run-matrix-$quadrant" "$recovery_script" env \
+        "$missing_unit_env"
+    else
+      run_fixed_script "$TMP/output-run-matrix-$quadrant" "$recovery_script"
+    fi
+    if [[ "$?" -ne 0 ]]; then
+      sed -n '1,200p' "$TMP/output-run-matrix-$quadrant" >&2
+      fail "$quadrant recovery script did not reach its validated terminal state"
+    fi
+
+    grep -Fqx 'matrix-old-runtime' "$TMP/opt/9router/current-marker" ||
+      fail "$quadrant did not restore the old runtime"
+    assert_file "$TMP/opt/9router.failed/.runtime/custom-server.js"
+    if [[ "$has_unit" == 1 ]]; then
+      cmp "$TMP/original-unit" "$TMP/etc/systemd/system/9router.service" ||
+        fail "$quadrant did not restore the old unit"
+      legacy_exec="$(sed -n 's/^ExecStart=//p' "$TMP/etc/systemd/system/9router.service")"
+      legacy_output="$("$legacy_exec")"
+      [[ "$legacy_output" == matrix-legacy-entrypoint-ok ]] ||
+        fail "$quadrant restored unit entrypoint is not executable"
+    else
+      assert_not_exists "$TMP/etc/systemd/system/9router.service"
+    fi
+    if [[ "$has_updater" == 1 ]]; then
+      cmp "$TMP/original-updater" "$TMP/usr/local/sbin/9router-update" ||
+        fail "$quadrant did not restore the old updater"
+      updater_output="$("$TMP/usr/local/sbin/9router-update")"
+      [[ "$updater_output" == matrix-legacy-updater-ok ]] ||
+        fail "$quadrant restored updater is not executable"
+    else
+      assert_not_exists "$TMP/usr/local/sbin/9router-update"
+    fi
+    if [[ "$expected_enable" == not-found ]]; then
+      grep -Fqx disabled "$TMP/systemctl.enabled" ||
+        fail "$quadrant did not remove the transient enable link"
+      assert_not_exists "$TMP/systemctl.wants-link"
+      if queried_enable="$(NINEROUTER_TEST_REALISTIC_MISSING_UNIT=1 \
+        run_fake_systemctl is-enabled 9router 2>/dev/null)"; then
+        fail "$quadrant missing unit unexpectedly reported an enabled state"
+      else
+        query_status=$?
+      fi
+      [[ "$query_status" -eq 4 && "$queried_enable" == not-found ]] ||
+        fail "$quadrant did not restore the externally observed not-found state"
+    else
+      grep -Fqx "$expected_enable" "$TMP/systemctl.enabled" ||
+        fail "$quadrant did not restore the original enable state"
+    fi
+    grep -Fqx "$expected_active" "$TMP/systemctl.state" ||
+      fail "$quadrant did not restore the original active state"
+    assert_no_fixed_recovery_materials
+    cleanup
+    TMP=""
+  done
+}
+
+test_recovery_generator_rejects_same_inode_material_tampering() {
+  local material material_path recorded_inode
+
+  for material in unit updater; do
+    new_install_tmp
+    make_fakes
+    prepare_legacy_installation
+    if run_installer "$TMP/output-generator-tamper-$material" env \
+      NINEROUTER_TEST_CURL_MODE=fail \
+      NINEROUTER_TEST_TAMPER_RECOVERY_ON_CURL="$material" \
+      NINEROUTER_TEST_TAMPER_INODE_FILE="$TMP/tamper-original-inode"; then
+      fail "installer succeeded despite same-inode $material generator tampering"
+    fi
+    material_path="$TMP/run/9router-install-recovery.$material"
+    assert_file "$material_path"
+    recorded_inode="$(<"$TMP/tamper-original-inode")"
+    [[ "$(file_inode "$material_path")" == "$recorded_inode" ]] ||
+      fail "$material generator test replaced the inode instead of mutating content"
+    grep -Fqx "same-inode-generator-tamper-$material" "$material_path" ||
+      fail "$material generator test did not retain the tampered bytes"
+    assert_not_exists "$TMP/run/9router-install-recover"
+    assert_not_exists "$TMP/run/9router-install-recover.step"
+    cmp "$SERVICE_UNIT" "$TMP/etc/systemd/system/9router.service" ||
+      fail "$material generator refusal changed the retained new unit"
+    cmp "$UPDATER" "$TMP/usr/local/sbin/9router-update" ||
+      fail "$material generator refusal changed the retained new updater"
+    cleanup
+    TMP=""
+  done
+}
+
+test_recovery_script_rejects_same_inode_material_tampering() {
+  local material material_path original_inode
+
+  for material in fixed-unit fixed-updater work-unit work-updater; do
+    new_install_tmp
+    make_fakes
+    prepare_legacy_installation
+    if run_installer "$TMP/output-execution-tamper-setup-$material" env \
+      NINEROUTER_TEST_CURL_MODE=fail; then
+      fail "$material execution-tamper setup unexpectedly succeeded"
+    fi
+    case "$material" in
+      fixed-unit) material_path="$TMP/run/9router-install-recovery.unit" ;;
+      fixed-updater) material_path="$TMP/run/9router-install-recovery.updater" ;;
+      work-unit) material_path="$TMP/run/9router-install-recovery.unit.work" ;;
+      work-updater) material_path="$TMP/run/9router-install-recovery.updater.work" ;;
+    esac
+    assert_file "$material_path"
+    original_inode="$(file_inode "$material_path")"
+    printf 'same-inode-execution-tamper-%s\n' "$material" >"$material_path"
+    [[ "$(file_inode "$material_path")" == "$original_inode" ]] ||
+      fail "$material execution test replaced the inode instead of mutating content"
+    if run_fixed_script "$TMP/output-execution-tamper-$material" \
+      "$TMP/run/9router-install-recover"; then
+      fail "recovery accepted same-inode $material content tampering"
+    fi
+    assert_file "$TMP/run/9router-install-recover"
+    assert_file "$material_path"
+    grep -Fqx "same-inode-execution-tamper-$material" "$material_path" ||
+      fail "$material tamper refusal consumed or rewrote the material"
+    cmp "$SERVICE_UNIT" "$TMP/etc/systemd/system/9router.service" ||
+      fail "$material tamper refusal changed the retained new unit"
+    cmp "$UPDATER" "$TMP/usr/local/sbin/9router-update" ||
+      fail "$material tamper refusal changed the retained new updater"
+    cleanup
+    TMP=""
+  done
+}
+
 test_joint_recovery_terminal_revalidates_systemd_and_rejects_bad_step() {
   new_install_tmp
   make_fakes
@@ -1343,6 +1739,9 @@ test_generated_script_intermediate_write_failures_are_not_published() {
   if run_installer "$TMP/output-cleanup-write-retry" env \
     NINEROUTER_TEST_CURL_MODE=fail; then
     fail 'cleanup-script normal retry setup unexpectedly succeeded'
+  fi
+  if [[ ! -f "$TMP/run/9router-install-cleanup" ]]; then
+    sed -n '1,200p' "$TMP/output-cleanup-write-retry" >&2
   fi
   assert_file "$TMP/run/9router-install-cleanup"
   [[ "$(file_mode "$TMP/run/9router-install-cleanup")" == 700 ]] || \
@@ -1605,14 +2004,18 @@ test_first_install_post_switch_cleanup_preserves_code_and_allows_retry() {
     NINEROUTER_TEST_CURL_MODE=fail; then
     fail 'retry unexpectedly succeeded during the repeated-health-failure scenario'
   fi
-  assert_file "$TMP/run/9router-install-cleanup"
+  assert_file "$TMP/run/9router-install-recover"
+  assert_not_exists "$TMP/run/9router-install-cleanup"
   if ! run_fixed_script "$TMP/output-second-cleanup" \
-    "$TMP/run/9router-install-cleanup"; then
-    fail 'repeated post-switch failure did not provide a usable cleanup script'
+    "$TMP/run/9router-install-recover"; then
+    fail 'repeated post-switch failure did not provide a usable runtime recovery script'
   fi
   assert_file "$TMP/opt/9router/.runtime/custom-server.js"
-  assert_file "$TMP/opt/9router/.previous-release-inspection/first-attempt-marker"
+  assert_file "$TMP/opt/9router/first-attempt-marker"
+  assert_file "$TMP/opt/9router.failed/.runtime/custom-server.js"
   assert_no_fixed_recovery_materials
+
+  rm -rf -- "$TMP/opt/9router.failed"
 
   if ! run_installer "$TMP/output-first-retry"; then
     fail 'installer could not retry after repeated first-install cleanup'
@@ -2120,12 +2523,28 @@ test_health_rejects_inactive_service_and_trap_preserves_recovery_state() {
   TMP=""
 }
 
+if [[ "${NINEROUTER_TEST_FOCUS_INSTALLER_RECOVERY:-0}" == 1 ]]; then
+  test_installer_persists_and_reconciles_entrypoint_move_intents
+  test_installer_reconciles_absent_entrypoints_after_crash
+  test_joint_recovery_covers_all_entrypoint_existence_quadrants
+  test_recovery_generator_rejects_same_inode_material_tampering
+  test_recovery_script_rejects_same_inode_material_tampering
+  printf 'PASS: focused installer recovery tests\n'
+  exit 0
+fi
+
 if [[ ! -f "$UPDATER" ]]; then
   fail "deploy/linux/9router-update is missing"
 fi
 
 test_service_unit_uses_fixed_production_paths_without_credentials
 test_installer_has_root_guard_and_preserves_data_directory
+test_installer_persists_and_reconciles_entrypoint_move_intents
+test_installer_reconciles_absent_entrypoints_after_crash
+test_joint_recovery_covers_all_entrypoint_existence_quadrants
+test_recovery_generator_rejects_same_inode_material_tampering
+test_recovery_script_rejects_same_inode_material_tampering
+test_generated_script_intermediate_write_failures_are_not_published
 test_installer_uses_only_test_paths_and_preserves_existing_data
 test_installer_rolls_back_unit_on_failure
 test_first_install_failure_removes_new_unit
@@ -2139,7 +2558,6 @@ test_switch_barrier_preserves_new_entrypoints_and_fixed_recovery_materials
 test_move_intent_failures_use_strict_scene_classification
 test_post_switch_failure_supports_legacy_joint_recovery
 test_joint_recovery_terminal_revalidates_systemd_and_rejects_bad_step
-test_generated_script_intermediate_write_failures_are_not_published
 test_joint_recovery_script_resumes_after_each_partial_failure
 test_joint_recovery_rejects_replaced_lock_inode
 test_joint_recovery_script_refuses_concurrent_updater_lock
