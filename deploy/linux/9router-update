@@ -8,7 +8,7 @@ INHERITED_LOCK_FD="${NINEROUTER_INHERITED_LOCK_FD:-}"
 if [[ "$EUID" -eq 0 && "${NINEROUTER_TEST_MODE:-0}" == 1 ]]; then
   ROOT_TEST_MODE=1
   TEST_ROOT="${NINEROUTER_TEST_ROOT:-}"
-  for override in ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE PHASE_FILE GIT NPM NODE SYSTEMCTL CURL MV STAT FLOCK MKDIR RM CP SLEEP; do
+  for override in ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE PHASE_FILE RECOVER_FILE GIT NPM NODE SYSTEMCTL CURL MV STAT FLOCK MKDIR RM CP SLEEP; do
     env_name="NINEROUTER_${override}"
     [[ -n "${!env_name+x}" ]] ||
       { printf 'root 测试模式缺少 %s\n' "$env_name" >&2; exit 1; }
@@ -18,6 +18,7 @@ if [[ "$EUID" -eq 0 && "${NINEROUTER_TEST_MODE:-0}" == 1 ]]; then
   PREVIOUS_DIR="$NINEROUTER_PREVIOUS_DIR"
   LOCK_FILE="$NINEROUTER_LOCK_FILE"
   PHASE_FILE="$NINEROUTER_PHASE_FILE"
+  RECOVER_FILE="$NINEROUTER_RECOVER_FILE"
   GIT="$NINEROUTER_GIT"
   NPM="$NINEROUTER_NPM"
   NPM_CLI="$NINEROUTER_NPM"
@@ -32,7 +33,7 @@ if [[ "$EUID" -eq 0 && "${NINEROUTER_TEST_MODE:-0}" == 1 ]]; then
   CP="$NINEROUTER_CP"
   SLEEP="$NINEROUTER_SLEEP"
 elif [[ "$EUID" -eq 0 ]]; then
-  for override in ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE PHASE_FILE GIT NPM NODE SYSTEMCTL CURL MV STAT FLOCK MKDIR RM CP SLEEP; do
+  for override in ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE PHASE_FILE RECOVER_FILE GIT NPM NODE SYSTEMCTL CURL MV STAT FLOCK MKDIR RM CP SLEEP; do
     env_name="NINEROUTER_${override}"
     [[ -z "${!env_name+x}" ]] || {
       printf 'root 环境拒绝 %s 覆盖\n' "$env_name" >&2
@@ -44,6 +45,7 @@ elif [[ "$EUID" -eq 0 ]]; then
   PREVIOUS_DIR=/opt/9router.previous
   LOCK_FILE=/run/9router-update.lock
   PHASE_FILE=/run/9router-update.phase
+  RECOVER_FILE=/run/9router-update.recover
   GIT=/usr/bin/git
   NPM=/opt/node-v24.15.0-npm/node/bin/npm
   NPM_CLI=/opt/node-v24.15.0-npm/node/lib/node_modules/npm/bin/npm-cli.js
@@ -63,6 +65,7 @@ else
   PREVIOUS_DIR="${NINEROUTER_PREVIOUS_DIR:-/opt/9router.previous}"
   LOCK_FILE="${NINEROUTER_LOCK_FILE:-/run/9router-update.lock}"
   PHASE_FILE="${NINEROUTER_PHASE_FILE:-/run/9router-update.phase}"
+  RECOVER_FILE="${NINEROUTER_RECOVER_FILE:-/run/9router-update.recover}"
   GIT="${NINEROUTER_GIT:-/usr/bin/git}"
   NPM="${NINEROUTER_NPM:-/opt/node-v24.15.0-npm/node/bin/npm}"
   NPM_CLI="${NINEROUTER_NPM_CLI:-$NPM}"
@@ -137,7 +140,7 @@ validate_root_test_mode() {
     *) die "root 测试根必须位于受限临时目录：$test_root_real" ;;
   esac
 
-  for variable_name in ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE PHASE_FILE GIT NPM NODE SYSTEMCTL CURL MV STAT FLOCK MKDIR RM CP SLEEP; do
+  for variable_name in ROOT BUILD_DIR PREVIOUS_DIR LOCK_FILE PHASE_FILE RECOVER_FILE GIT NPM NODE SYSTEMCTL CURL MV STAT FLOCK MKDIR RM CP SLEEP; do
     candidate="${!variable_name}"
     resolved="$("$REALPATH" -m -- "$candidate")" ||
       die "root 测试路径无法 realpath：$variable_name"
@@ -152,6 +155,7 @@ PREVIOUS_DIR="$(normalize_path PREVIOUS_DIR "$PREVIOUS_DIR")"
 RETIRED_DIR="$(normalize_path RETIRED_DIR "${PREVIOUS_DIR}.retired")"
 LOCK_FILE="$(normalize_path LOCK_FILE "$LOCK_FILE")"
 PHASE_FILE="$(normalize_path PHASE_FILE "$PHASE_FILE")"
+RECOVER_FILE="$(normalize_path RECOVER_FILE "$RECOVER_FILE")"
 if paths_overlap "$ROOT" "$BUILD_DIR" ||
   paths_overlap "$ROOT" "$PREVIOUS_DIR" ||
   paths_overlap "$ROOT" "$LOCK_FILE" ||
@@ -161,7 +165,12 @@ if paths_overlap "$ROOT" "$BUILD_DIR" ||
   paths_overlap "$ROOT" "$PHASE_FILE" ||
   paths_overlap "$BUILD_DIR" "$PHASE_FILE" ||
   paths_overlap "$PREVIOUS_DIR" "$PHASE_FILE" ||
-  paths_overlap "$LOCK_FILE" "$PHASE_FILE"; then
+  paths_overlap "$LOCK_FILE" "$PHASE_FILE" ||
+  paths_overlap "$ROOT" "$RECOVER_FILE" ||
+  paths_overlap "$BUILD_DIR" "$RECOVER_FILE" ||
+  paths_overlap "$PREVIOUS_DIR" "$RECOVER_FILE" ||
+  paths_overlap "$LOCK_FILE" "$RECOVER_FILE" ||
+  paths_overlap "$PHASE_FILE" "$RECOVER_FILE"; then
   die "部署目录不得相同或互为祖先子孙目录"
 fi
 if [[ "$ROOT_TEST_MODE" -eq 1 ]]; then
@@ -200,6 +209,15 @@ fi
 
 phase="preparing"
 phase_temp=""
+recover_temp=""
+recover_stage=""
+recover_origin_phase=""
+recover_phase_id=""
+recover_previous_id=""
+recover_root_state=""
+recover_root_id=""
+recover_build_state=""
+recover_build_id=""
 swapped=0
 had_existing_root=0
 
@@ -237,6 +255,461 @@ service_is_explicitly_stopped() {
     status=$?
   fi
   [[ "$status" -eq 3 && ( "$state" == inactive || "$state" == failed ) ]]
+}
+
+reconcile_previous_cleanup() {
+  local cleanup_phase=missing
+
+  if [[ -e "$PHASE_FILE" || -L "$PHASE_FILE" ]]; then
+    [[ -f "$PHASE_FILE" && ! -L "$PHASE_FILE" ]] ||
+      die 'previous 收尾阶段文件不安全'
+    cleanup_phase="$(<"$PHASE_FILE")"
+  fi
+
+  if [[ -e "$RETIRED_DIR" || -L "$RETIRED_DIR" ]]; then
+    [[ -d "$RETIRED_DIR" && ! -L "$RETIRED_DIR" ]] ||
+      die 'retired 路径不安全'
+    [[ ! -e "$PREVIOUS_DIR" && ! -L "$PREVIOUS_DIR" ]] ||
+      die 'previous 与 retired 同时存在，拒绝猜测收尾现场'
+    case "$cleanup_phase" in
+      previous_cleanup_intent)
+        phase="$cleanup_phase"
+        write_phase previous_retired
+        ;;
+      previous_retired)
+        phase="$cleanup_phase"
+        ;;
+      *) die "retired 与阶段不匹配：$cleanup_phase" ;;
+    esac
+    "$RM" -rf -- "$RETIRED_DIR"
+    [[ ! -e "$RETIRED_DIR" && ! -L "$RETIRED_DIR" ]] ||
+      die 'retired 目录删除未完成'
+    write_phase healthy
+    return 0
+  fi
+
+  case "$cleanup_phase" in
+    previous_cleanup_intent)
+      phase="$cleanup_phase"
+      [[ -d "$ROOT" && ! -L "$ROOT" ]] ||
+        die 'previous 收尾时正式目录不完整'
+      [[ -d "$PREVIOUS_DIR" && ! -L "$PREVIOUS_DIR" ]] ||
+        die 'previous_cleanup_intent 缺少完整 previous，拒绝继续'
+      "$MV" -T -n -- "$PREVIOUS_DIR" "$RETIRED_DIR"
+      [[ ! -e "$PREVIOUS_DIR" && ! -L "$PREVIOUS_DIR" &&
+        -d "$RETIRED_DIR" && ! -L "$RETIRED_DIR" ]] ||
+        die 'previous 退役切换未完成'
+      write_phase previous_retired
+      "$RM" -rf -- "$RETIRED_DIR"
+      [[ ! -e "$RETIRED_DIR" && ! -L "$RETIRED_DIR" ]] ||
+        die 'retired 目录删除未完成'
+      write_phase healthy
+      ;;
+    previous_retired)
+      phase="$cleanup_phase"
+      [[ ! -e "$PREVIOUS_DIR" && ! -L "$PREVIOUS_DIR" ]] ||
+        die 'previous_retired 阶段重新出现 previous，拒绝继续'
+      write_phase healthy
+      ;;
+  esac
+}
+
+path_is_absent() {
+  [[ ! -e "$1" && ! -L "$1" ]]
+}
+
+safe_directory_with_id() {
+  local expected_id="$1"
+  local path="$2"
+  local actual_id
+
+  [[ -d "$path" && ! -L "$path" ]] || return 1
+  actual_id="$("$STAT" -Lc '%d:%i' -- "$path")" || return 1
+  [[ "$actual_id" == "$expected_id" ]]
+}
+
+read_recover_value() {
+  local expected_key="$1"
+  local destination_variable="$2"
+  local line
+
+  IFS= read -r line <&7 || return 1
+  [[ "$line" == "$expected_key="* && "$line" != "$expected_key=" ]] || return 1
+  printf -v "$destination_variable" '%s' "${line#*=}"
+}
+
+write_recover_stage() {
+  local next_stage="$1"
+  local recover_parent="${RECOVER_FILE%/*}"
+
+  case "$next_stage" in
+    prepared|stop_intent|stopped|retire_root_intent|root_retired|restore_root_intent|root_restored|start_intent|started|retired_cleanup_intent|retired_cleaned|phase_cleanup_intent|phase_cleaned) ;;
+    *) die "拒绝写入未知恢复阶段：$next_stage" ;;
+  esac
+  [[ -d "$recover_parent" && ! -L "$recover_parent" ]] ||
+    die '恢复阶段父目录不安全'
+  if [[ -L "$RECOVER_FILE" || ( -e "$RECOVER_FILE" && ! -f "$RECOVER_FILE" ) ]]; then
+    die '恢复阶段文件必须为不存在或普通文件'
+  fi
+  recover_temp="$(/usr/bin/mktemp "${RECOVER_FILE}.tmp.XXXXXX")"
+  if ! printf '%s\n' \
+    'version=1' \
+    "stage=$next_stage" \
+    "origin_phase=$recover_origin_phase" \
+    "phase_id=$recover_phase_id" \
+    "previous_id=$recover_previous_id" \
+    "root_state=$recover_root_state" \
+    "root_id=$recover_root_id" \
+    "build_state=$recover_build_state" \
+    "build_id=$recover_build_id" >"$recover_temp" ||
+    ! /bin/chmod 0600 "$recover_temp" ||
+    ! "$MV" -fT -- "$recover_temp" "$RECOVER_FILE"; then
+    "$RM" -f -- "$recover_temp" || true
+    recover_temp=""
+    die '无法原子持久化 --recover 阶段'
+  fi
+  recover_temp=""
+  recover_stage="$next_stage"
+}
+
+load_recover_state() {
+  local state_version
+  local extra_line
+
+  [[ -f "$RECOVER_FILE" && ! -L "$RECOVER_FILE" ]] || return 1
+  [[ "$("$STAT" -c %a -- "$RECOVER_FILE")" == 600 ]] || return 1
+  exec 7<"$RECOVER_FILE" || return 1
+  read_recover_value version state_version &&
+    read_recover_value stage recover_stage &&
+    read_recover_value origin_phase recover_origin_phase &&
+    read_recover_value phase_id recover_phase_id &&
+    read_recover_value previous_id recover_previous_id &&
+    read_recover_value root_state recover_root_state &&
+    read_recover_value root_id recover_root_id &&
+    read_recover_value build_state recover_build_state &&
+    read_recover_value build_id recover_build_id || {
+      exec 7<&-
+      return 1
+    }
+  if IFS= read -r extra_line <&7; then
+    exec 7<&-
+    return 1
+  fi
+  exec 7<&-
+
+  [[ "$state_version" == 1 && "$recover_phase_id" =~ ^[0-9]+:[0-9]+$ &&
+    "$recover_previous_id" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  case "$recover_stage" in
+    prepared|stop_intent|stopped|retire_root_intent|root_retired|restore_root_intent|root_restored|start_intent|started|retired_cleanup_intent|retired_cleaned|phase_cleanup_intent|phase_cleaned) ;;
+    *) return 1 ;;
+  esac
+  case "$recover_origin_phase" in old_moved|new_moved|started|health_failed) ;; *) return 1 ;; esac
+  case "$recover_root_state" in
+    absent) [[ "$recover_root_id" == absent ]] || return 1 ;;
+    present) [[ "$recover_root_id" =~ ^[0-9]+:[0-9]+$ ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  case "$recover_build_state" in
+    absent) [[ "$recover_build_id" == absent ]] || return 1 ;;
+    present) [[ "$recover_build_id" =~ ^[0-9]+:[0-9]+$ ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+recover_phase_is_intact() {
+  local actual_id
+
+  [[ -f "$PHASE_FILE" && ! -L "$PHASE_FILE" ]] || return 1
+  actual_id="$("$STAT" -Lc '%d:%i' -- "$PHASE_FILE")" || return 1
+  [[ "$actual_id" == "$recover_phase_id" &&
+    "$(<"$PHASE_FILE")" == "$recover_origin_phase" ]]
+}
+
+recover_build_is_intact() {
+  case "$recover_build_state" in
+    present) safe_directory_with_id "$recover_build_id" "$BUILD_DIR" ;;
+    absent) path_is_absent "$BUILD_DIR" ;;
+    *) return 1 ;;
+  esac
+}
+
+recover_root_scene() {
+  if [[ "$recover_root_state" == present ]]; then
+    if safe_directory_with_id "$recover_root_id" "$ROOT" &&
+      path_is_absent "$RETIRED_DIR" &&
+      safe_directory_with_id "$recover_previous_id" "$PREVIOUS_DIR"; then
+      printf 'new_root\n'
+    elif path_is_absent "$ROOT" &&
+      safe_directory_with_id "$recover_root_id" "$RETIRED_DIR" &&
+      safe_directory_with_id "$recover_previous_id" "$PREVIOUS_DIR"; then
+      printf 'new_retired\n'
+    elif safe_directory_with_id "$recover_previous_id" "$ROOT" &&
+      safe_directory_with_id "$recover_root_id" "$RETIRED_DIR" &&
+      path_is_absent "$PREVIOUS_DIR"; then
+      printf 'old_restored\n'
+    elif safe_directory_with_id "$recover_previous_id" "$ROOT" &&
+      path_is_absent "$RETIRED_DIR" && path_is_absent "$PREVIOUS_DIR"; then
+      printf 'old_restored_clean\n'
+    else
+      return 1
+    fi
+  elif path_is_absent "$ROOT" && path_is_absent "$RETIRED_DIR" &&
+    safe_directory_with_id "$recover_previous_id" "$PREVIOUS_DIR"; then
+    printf 'root_absent\n'
+  elif safe_directory_with_id "$recover_previous_id" "$ROOT" &&
+    path_is_absent "$RETIRED_DIR" && path_is_absent "$PREVIOUS_DIR"; then
+    printf 'old_restored\n'
+  else
+    return 1
+  fi
+}
+
+read_recover_service_state() {
+  if recover_service_state="$("$SYSTEMCTL" is-active 9router 2>/dev/null)"; then
+    recover_service_status=0
+  else
+    recover_service_status=$?
+  fi
+}
+
+recover_service_is_stopped() {
+  [[ ( "$recover_service_status" -eq 3 &&
+    ( "$recover_service_state" == inactive || "$recover_service_state" == failed ) ) ||
+    ( "$recover_service_status" -eq 4 && "$recover_service_state" == inactive ) ]]
+}
+
+recover_service_is_running() {
+  case "$recover_service_state:$recover_service_status" in
+    active:0|reloading:0|activating:0|activating:3|deactivating:0|deactivating:3) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+recover_service_is_active() {
+  [[ "$recover_service_status" -eq 0 && "$recover_service_state" == active ]]
+}
+
+require_recover_service_stopped() {
+  read_recover_service_state
+  recover_service_is_stopped || die '无法确认服务已停止；--recover 拒绝修改目录'
+}
+
+validate_recover_static_scene() {
+  recover_build_is_intact || die 'BUILD 现场与 --recover 初始记录不一致'
+  case "$recover_stage" in
+    phase_cleanup_intent)
+      recover_phase_is_intact || path_is_absent "$PHASE_FILE" ||
+        die '原更新阶段在清理 intent 后发生变化'
+      ;;
+    phase_cleaned)
+      path_is_absent "$PHASE_FILE" || die '原更新阶段尚未清理'
+      ;;
+    *) recover_phase_is_intact || die '原更新阶段文件已变化' ;;
+  esac
+}
+
+initialize_recover_state() {
+  [[ -f "$PHASE_FILE" && ! -L "$PHASE_FILE" ]] || die '没有可恢复的更新阶段'
+  recover_origin_phase="$(<"$PHASE_FILE")"
+  case "$recover_origin_phase" in old_moved|new_moved|started|health_failed) ;; *) die "当前阶段不可恢复：$recover_origin_phase" ;; esac
+  [[ -d "$PREVIOUS_DIR" && ! -L "$PREVIOUS_DIR" ]] ||
+    die '恢复现场缺少完整 previous，拒绝操作'
+  path_is_absent "$RETIRED_DIR" || die 'retired 路径已存在，拒绝初始化恢复'
+  recover_phase_id="$("$STAT" -Lc '%d:%i' -- "$PHASE_FILE")" ||
+    die '无法记录原更新阶段 inode'
+  recover_previous_id="$("$STAT" -Lc '%d:%i' -- "$PREVIOUS_DIR")" ||
+    die '无法记录 previous inode'
+
+  case "$recover_origin_phase" in
+    old_moved)
+      path_is_absent "$ROOT" || die 'old_moved 规范现场要求 ROOT 不存在'
+      [[ -d "$BUILD_DIR" && ! -L "$BUILD_DIR" ]] ||
+        die 'old_moved 规范现场要求 BUILD 完整存在'
+      recover_root_state=absent
+      recover_root_id=absent
+      recover_build_state=present
+      recover_build_id="$("$STAT" -Lc '%d:%i' -- "$BUILD_DIR")" ||
+        die '无法记录 BUILD inode'
+      ;;
+    new_moved|started|health_failed)
+      [[ -d "$ROOT" && ! -L "$ROOT" ]] || die '恢复现场缺少完整 ROOT'
+      path_is_absent "$BUILD_DIR" || die '切换后恢复现场不应重新出现 BUILD'
+      recover_root_state=present
+      recover_root_id="$("$STAT" -Lc '%d:%i' -- "$ROOT")" ||
+        die '无法记录 ROOT inode'
+      recover_build_state=absent
+      recover_build_id=absent
+      ;;
+  esac
+  phase="$recover_origin_phase"
+  write_recover_stage prepared
+}
+
+recover_update() {
+  local scene
+  local command_status
+
+  if [[ -e "$RECOVER_FILE" || -L "$RECOVER_FILE" ]]; then
+    load_recover_state || die '持久化 --recover 状态无效；拒绝修改现场'
+    phase="$recover_origin_phase"
+  else
+    initialize_recover_state
+  fi
+  validate_recover_static_scene
+
+  if [[ "$recover_stage" == prepared ]]; then
+    scene="$(recover_root_scene)" || die 'prepared 恢复现场不确定'
+    case "$scene" in new_root|root_absent) ;; *) die 'prepared 恢复现场已越过记录阶段' ;; esac
+    write_recover_stage stop_intent
+  fi
+
+  if [[ "$recover_stage" == stop_intent ]]; then
+    scene="$(recover_root_scene)" || die 'stop intent 恢复现场不确定'
+    case "$scene" in new_root|root_absent) ;; *) die 'stop intent 恢复现场已变化' ;; esac
+    read_recover_service_state
+    command_status=0
+    if recover_service_is_running; then
+      if "$SYSTEMCTL" stop 9router; then command_status=0; else command_status=$?; fi
+      read_recover_service_state
+    elif ! recover_service_is_stopped; then
+      die '无法确认恢复前的服务状态'
+    fi
+    recover_service_is_stopped || die '停止服务后状态不明确；--recover 未移动目录'
+    write_recover_stage stopped
+    [[ "$command_status" -eq 0 ]] ||
+      die '服务已停止并提交恢复阶段，但 stop 命令报错；请重试 --recover'
+  fi
+
+  if [[ "$recover_stage" == stopped ]]; then
+    scene="$(recover_root_scene)" || die 'stopped 恢复现场不确定'
+    case "$scene" in new_root|root_absent) ;; *) die 'stopped 恢复现场已变化' ;; esac
+    require_recover_service_stopped
+    if [[ "$recover_root_state" == present ]]; then
+      write_recover_stage retire_root_intent
+    else
+      write_recover_stage root_retired
+    fi
+  fi
+
+  if [[ "$recover_stage" == retire_root_intent ]]; then
+    require_recover_service_stopped
+    scene="$(recover_root_scene)" || die 'retire ROOT intent 现场不确定'
+    command_status=0
+    if [[ "$scene" == new_root ]]; then
+      if "$MV" -T -n -- "$ROOT" "$RETIRED_DIR"; then command_status=0; else command_status=$?; fi
+      scene="$(recover_root_scene)" || die 'retire ROOT 命令后现场不确定'
+    fi
+    [[ "$scene" == new_retired ]] || die '失败 ROOT 未安全转存到 retired'
+    write_recover_stage root_retired
+    [[ "$command_status" -eq 0 ]] ||
+      die '失败 ROOT 已转存并提交恢复阶段，但 mv 命令报错；请重试 --recover'
+  fi
+
+  if [[ "$recover_stage" == root_retired ]]; then
+    require_recover_service_stopped
+    scene="$(recover_root_scene)" || die 'root_retired 恢复现场不确定'
+    case "$scene" in new_retired|root_absent) ;; *) die 'root_retired 恢复现场已变化' ;; esac
+    write_recover_stage restore_root_intent
+  fi
+
+  if [[ "$recover_stage" == restore_root_intent ]]; then
+    require_recover_service_stopped
+    scene="$(recover_root_scene)" || die 'restore ROOT intent 现场不确定'
+    command_status=0
+    case "$scene" in
+      new_retired|root_absent)
+        if "$MV" -T -n -- "$PREVIOUS_DIR" "$ROOT"; then command_status=0; else command_status=$?; fi
+        scene="$(recover_root_scene)" || die '恢复 ROOT 命令后现场不确定'
+        ;;
+      old_restored) ;;
+      *) die 'restore ROOT intent 现场已变化' ;;
+    esac
+    [[ "$scene" == old_restored ]] || die '旧 ROOT 恢复未完成'
+    write_recover_stage root_restored
+    [[ "$command_status" -eq 0 ]] ||
+      die '旧 ROOT 已恢复并提交阶段，但 mv 命令报错；请重试 --recover'
+  fi
+
+  if [[ "$recover_stage" == root_restored ]]; then
+    scene="$(recover_root_scene)" || die 'root_restored 恢复现场不确定'
+    [[ "$scene" == old_restored ]] || die 'root_restored 恢复现场已变化'
+    write_recover_stage start_intent
+  fi
+
+  if [[ "$recover_stage" == start_intent ]]; then
+    scene="$(recover_root_scene)" || die 'start intent 恢复现场不确定'
+    [[ "$scene" == old_restored ]] || die 'start intent ROOT 现场已变化'
+    read_recover_service_state
+    command_status=0
+    if ! recover_service_is_active; then
+      recover_service_is_stopped || die '启动前服务处于不明确状态'
+      if "$SYSTEMCTL" start 9router; then command_status=0; else command_status=$?; fi
+      read_recover_service_state
+    fi
+    recover_service_is_active || die '旧版本恢复后未明确处于 active'
+    write_recover_stage started
+    [[ "$command_status" -eq 0 ]] ||
+      die '旧服务已启动并提交恢复阶段，但 start 命令报错；请重试 --recover'
+  fi
+
+  if [[ "$recover_stage" == started ]]; then
+    scene="$(recover_root_scene)" || die 'started 恢复现场不确定'
+    [[ "$scene" == old_restored ]] || die 'started 恢复现场已变化'
+    read_recover_service_state
+    recover_service_is_active || die '已提交 started 的旧服务不再 active'
+    write_recover_stage retired_cleanup_intent
+  fi
+
+  if [[ "$recover_stage" == retired_cleanup_intent ]]; then
+    read_recover_service_state
+    recover_service_is_active || die '清理 retired 前旧服务不再 active'
+    scene="$(recover_root_scene)" || die 'retired cleanup intent 现场不确定'
+    command_status=0
+    if [[ "$recover_root_state" == present && "$scene" == old_restored ]]; then
+      if "$RM" -rf -- "$RETIRED_DIR"; then command_status=0; else command_status=$?; fi
+      scene="$(recover_root_scene)" || die '清理 retired 后现场不确定'
+    fi
+    if [[ "$recover_root_state" == present ]]; then
+      [[ "$scene" == old_restored_clean ]] || die 'retired 清理未完成'
+    else
+      [[ "$scene" == old_restored ]] || die '规范 old_moved 恢复现场已变化'
+    fi
+    write_recover_stage retired_cleaned
+    [[ "$command_status" -eq 0 ]] ||
+      die 'retired 已清理并提交恢复阶段，但 rm 命令报错；请重试 --recover'
+  fi
+
+  if [[ "$recover_stage" == retired_cleaned ]]; then
+    write_recover_stage phase_cleanup_intent
+  fi
+
+  if [[ "$recover_stage" == phase_cleanup_intent ]]; then
+    validate_recover_static_scene
+    command_status=0
+    if recover_phase_is_intact; then
+      if "$RM" -f -- "$PHASE_FILE"; then command_status=0; else command_status=$?; fi
+    fi
+    path_is_absent "$PHASE_FILE" || die '原更新阶段清理未完成'
+    write_recover_stage phase_cleaned
+    [[ "$command_status" -eq 0 ]] ||
+      die '原更新阶段已清理并提交恢复阶段，但 rm 命令报错；请重试 --recover'
+  fi
+
+  if [[ "$recover_stage" == phase_cleaned ]]; then
+    validate_recover_static_scene
+    scene="$(recover_root_scene)" || die '恢复终态 ROOT 现场不确定'
+    if [[ "$recover_root_state" == present ]]; then
+      [[ "$scene" == old_restored_clean ]] || die '恢复终态仍存在 retired'
+    else
+      [[ "$scene" == old_restored ]] || die '规范 old_moved 恢复终态已变化'
+    fi
+    read_recover_service_state
+    recover_service_is_active || die '恢复终态旧服务不再 active'
+    if ! "$RM" -f -- "$RECOVER_FILE"; then
+      path_is_absent "$RECOVER_FILE" || die '无法清理持久化 --recover 状态'
+    fi
+    printf '9Router 已按显式 --recover 请求恢复旧版本。\n'
+  fi
 }
 
 device_for_path() {
@@ -347,6 +820,9 @@ on_exit() {
   if [[ -n "$phase_temp" && ( -e "$phase_temp" || -L "$phase_temp" ) ]]; then
     "$RM" -f -- "$phase_temp" || true
   fi
+  if [[ -n "$recover_temp" && ( -e "$recover_temp" || -L "$recover_temp" ) ]]; then
+    "$RM" -f -- "$recover_temp" || true
+  fi
   if [[ "$exit_code" -ne 0 ]]; then
     report_failure "$exit_code"
   fi
@@ -357,31 +833,17 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 if [[ "${1:-}" == --recover ]]; then
-  [[ -f "$PHASE_FILE" && ! -L "$PHASE_FILE" ]] || die '没有可恢复的更新阶段'
-  recovery_phase="$(<"$PHASE_FILE")"
-  case "$recovery_phase" in old_moved|new_moved|started|health_failed) ;; *) die "当前阶段不可恢复：$recovery_phase" ;; esac
-  [[ -d "$PREVIOUS_DIR" && ! -L "$PREVIOUS_DIR" && -d "$ROOT" && ! -L "$ROOT" ]] || die '恢复现场不完整，拒绝操作'
-  "$SYSTEMCTL" stop 9router
-  service_is_explicitly_stopped || die '服务未停止，拒绝恢复'
-  [[ ! -e "$RETIRED_DIR" && ! -L "$RETIRED_DIR" ]] || die 'retired 路径已存在，拒绝恢复'
-  "$MV" -T -n -- "$ROOT" "$RETIRED_DIR"
-  "$MV" -T -n -- "$PREVIOUS_DIR" "$ROOT"
-  "$SYSTEMCTL" start 9router
-  "$SYSTEMCTL" is-active --quiet 9router || die '旧版本恢复后未启动'
-  "$RM" -rf -- "$RETIRED_DIR"
-  "$RM" -f -- "$PHASE_FILE"
-  printf '9Router 已按显式 --recover 请求恢复旧版本。\n'
+  [[ "$#" -eq 1 ]] || die '--recover 不接受其他参数'
+  recover_update
   exit 0
 fi
+[[ "$#" -eq 0 ]] || die "未知参数：$1"
 
-if [[ -e "$RETIRED_DIR" || -L "$RETIRED_DIR" ]]; then
-  [[ -d "$RETIRED_DIR" && ! -L "$RETIRED_DIR" ]] || die 'retired 路径不安全'
-  [[ -f "$PHASE_FILE" && ! -L "$PHASE_FILE" ]] || die 'retired 存在但缺少可信阶段文件'
-  cleanup_phase="$(<"$PHASE_FILE")"
-  case "$cleanup_phase" in previous_cleanup_intent|previous_retired) ;; *) die "retired 与阶段不匹配：$cleanup_phase" ;; esac
-  "$RM" -rf -- "$RETIRED_DIR"
-  write_phase healthy
+if [[ -e "$RECOVER_FILE" || -L "$RECOVER_FILE" ]]; then
+  die '检测到未完成的显式恢复；请先重试 9router-update --recover'
 fi
+
+reconcile_previous_cleanup
 
 write_phase preparing
 if [[ -e "$PREVIOUS_DIR" || -L "$PREVIOUS_DIR" ]]; then
@@ -421,15 +883,22 @@ RUNTIME_DIR="$BUILD_DIR/.runtime"
 ensure_deployment_same_device
 
 service_was_active=0
-if "$SYSTEMCTL" is-active --quiet 9router; then
-  service_was_active=1
-  write_phase stopping
-  "$SYSTEMCTL" stop 9router || die "停止 9Router 服务失败，拒绝切换目录"
-  service_is_explicitly_stopped || die "9Router 服务未明确处于 inactive 或 failed 状态，拒绝切换目录"
+if service_state="$("$SYSTEMCTL" is-active 9router 2>/dev/null)"; then
+  service_query_status=0
 else
-  active_query_status=$?
-  case "$active_query_status" in 3|4) ;; *) die '无法确认 9Router 运行状态，拒绝切换目录' ;; esac
+  service_query_status=$?
 fi
+case "$service_state:$service_query_status" in
+  active:0|reloading:0|activating:0|activating:3|deactivating:0|deactivating:3)
+    service_was_active=1
+    write_phase stopping
+    "$SYSTEMCTL" stop 9router || die "停止 9Router 服务失败，拒绝切换目录"
+    service_is_explicitly_stopped ||
+      die "9Router 服务未明确处于 inactive 或 failed 状态，拒绝切换目录"
+    ;;
+  inactive:3|failed:3|inactive:4) ;;
+  *) die '无法确认 9Router 运行状态，拒绝切换目录' ;;
+esac
 
 if [[ -e "$ROOT" ]]; then
   [[ -d "$ROOT" && ! -L "$ROOT" ]] ||

@@ -115,6 +115,14 @@ journalctl -u 9router -n 100 --no-pager
 
 `9router-update` 仅在成功退出后才会删除上一个临时部署目录 `/opt/9router.previous`。更新失败时会保留切换现场，不会输出可脱离锁执行的 `rm` 或 `mv` 恢复命令。
 
+当失败阶段为 `old_moved`、`new_moved`、`started` 或 `health_failed`，且现场仍保留完整的 `/opt/9router.previous` 时，可在核对目录后显式恢复旧版本：
+
+```bash
+sudo 9router-update --recover
+```
+
+显式恢复与日常更新使用同一个锁，并将停止服务、恢复 ROOT、启动旧版本和清理现场分别持久化为可重入阶段；若命令提示某一步已生效但返回失败，保持现场不变并重复执行 `sudo 9router-update --recover`。其他阶段或现场不匹配时更新器会拒绝猜测恢复。
+
 若安装器输出「人工联合恢复：`<路径>`」或「首次安装安全收尾：`<路径>`」，请在确认现场后，以安装器实际输出的 `/run` 脚本路径为准并使用 `sudo <输出的/run 脚本路径>` 执行（例如 `sudo /run/9router-install-recover`）。两类脚本都会校验锁和现场，不能用旧版手工恢复命令替代。相关恢复材料位于 `/run`，重启后会丢失；必须在重启前处理或保留现场并人工核对。
 
 ### systemd

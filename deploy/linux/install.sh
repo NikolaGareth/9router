@@ -1436,7 +1436,7 @@ ensure_stopped_or_missing() {
   else
     active_status=$?
   fi
-  if [[ "$active_status" -eq 4 && "$active_state" == unknown ]]; then
+  if [[ "$active_status" -eq 4 && "$active_state" == inactive ]]; then
     return 0
   fi
   [[ "$active_status" -eq 3 &&
@@ -1483,7 +1483,7 @@ validate_restored_systemd_state() {
       active_status=$?
     fi
     if [[ "$EXPECTED_ENABLE_STATE" == not-found ]]; then
-      [[ "$active_status" -eq 4 && "$active_state" == unknown ]] ||
+      [[ "$active_status" -eq 4 && "$active_state" == inactive ]] ||
         die '恢复后的缺失服务运行状态无法确认'
     else
       [[ "$active_status" -eq 3 &&
@@ -1984,7 +1984,7 @@ validate_cleanup_systemd_state() {
     return 0
   fi
   [[ "$allow_missing" == 1 && "$active_status" -eq 4 &&
-    "$active_state" == unknown ]] ||
+    "$active_state" == inactive ]] ||
     die '首次安装收尾后的服务运行状态无法确认'
 }
 
@@ -2451,18 +2451,16 @@ case "$ENABLE_STATE" in
   *) die '无法确认 9router 原始 enable 状态，拒绝写入安装入口' ;;
 esac
 
-if [[ "$ENABLE_STATE" != not-found ]]; then
-  if "$SYSTEMCTL" is-active --quiet 9router 2>/dev/null; then
-    ACTIVE_QUERY_STATUS=0
-  else
-    ACTIVE_QUERY_STATUS=$?
-  fi
-  case "$ACTIVE_QUERY_STATUS" in
-    0) SERVICE_WAS_ACTIVE=1 ;;
-    3|4) SERVICE_WAS_ACTIVE=0 ;;
-    *) die '无法确认 9router 原始运行状态，拒绝写入安装入口' ;;
-  esac
+if "$SYSTEMCTL" is-active --quiet 9router 2>/dev/null; then
+  ACTIVE_QUERY_STATUS=0
+else
+  ACTIVE_QUERY_STATUS=$?
 fi
+case "$ACTIVE_QUERY_STATUS" in
+  0) SERVICE_WAS_ACTIVE=1 ;;
+  3|4) SERVICE_WAS_ACTIVE=0 ;;
+  *) die '无法确认 9router 原始运行状态，拒绝写入安装入口' ;;
+esac
 
 if [[ "$ENABLE_STATE" == masked && "$SERVICE_WAS_ACTIVE" -eq 1 ]]; then
   die '检测到 9router 同时为 masked 且 active；请先 unmask 并确认运行状态后再安装'

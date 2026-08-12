@@ -91,3 +91,24 @@ The parent task will record the final three syntax checks and `git diff --check`
 聚焦测试真实执行 A 的 SIGKILL/重启调和、B 的四个存在性象限及恢复脚本终态、C 的生成期 fixed 和执行期 fixed/work 同 inode 篡改拒绝；不是仅对生成文本做 grep。完整测试保持默认行为，显式聚焦环境变量未设置时不会跳过其他集成场景。
 
 独立审查首次指出 originally absent unit 会在删除后重复执行 `disable`，导致恢复状态永久残留。新增 updater/unit 两个 SIGKILL 回归先在旧实现上稳定失败；修复将 enable-link 清理前移到 unit 仍存在时。修复后的聚焦套件、完整套件和独立复核全部通过，无已知功能缺陷。
+
+## 2026-08-12 终审四项 Important 最终验证
+
+状态：**DONE**。本轮变更范围仅包含终审确认的 systemd 语义、updater 停服判定、可重入 `--recover`、previous cleanup 启动调和，以及对应测试/README/报告；未扩展其他产品行为。
+
+| 验证 | 结果 |
+| --- | --- |
+| `NINEROUTER_TEST_FOCUS_IMPORTANT=installer-systemd bash deploy/linux/test-9router-update.sh` | PASS，exit 0 |
+| `NINEROUTER_TEST_FOCUS_IMPORTANT=updater-systemd bash deploy/linux/test-9router-update.sh` | PASS，exit 0 |
+| `NINEROUTER_TEST_FOCUS_IMPORTANT=updater-recover bash deploy/linux/test-9router-update.sh` | PASS，exit 0 |
+| `NINEROUTER_TEST_FOCUS_IMPORTANT=previous-cleanup bash deploy/linux/test-9router-update.sh` | PASS，exit 0 |
+| `bash -n deploy/linux/9router-update` | PASS，exit 0 |
+| `bash -n deploy/linux/install.sh` | PASS，exit 0 |
+| `bash -n deploy/linux/test-9router-update.sh` | PASS，exit 0 |
+| `bash deploy/linux/test-9router-update.sh` | PASS，exit 0，最终直接打印 `PASS: 9router Linux updater tests` |
+| `npm ci --dry-run --ignore-scripts` | PASS，exit 0，报告 added 77 packages；未执行 lifecycle scripts |
+| `git diff --check` | PASS，exit 0 |
+
+完整集成的第一次执行只命中一条旧事件序列断言：断言仍期待 updater 使用 `is-active --quiet`，实际行为已按终审要求改为读取文本状态。将该契约断言改为 `systemctl is-active 9router` 后，从头重跑完整套件一次直接到最终 PASS。测试输出中的 `Killed: 9` 均来自既有或本轮显式 SIGKILL 故障注入，套件未因此提前退出。
+
+最终差异自审确认恢复状态文件为固定 0600 普通文件、路径与 ROOT/BUILD/previous/lock/phase 互斥；所有恢复动作都在共享锁内，阶段重跑前复验 phase 及目录 inode/形态，未知 systemd 状态和歧义目录现场均在破坏性操作前拒绝。当前无已知功能缺陷。

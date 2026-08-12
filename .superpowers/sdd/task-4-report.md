@@ -31,3 +31,9 @@
 ## 2026-08-11 认证边界补充
 
 密码登录在未持久化密码且未配置 `INITIAL_PASSWORD` 时，对非 loopback 请求在签发 cookie 之前返回 503；首次部署随机密码只落 root-only 外部环境文件，终端不显示秘密。目标路由 ESLint 通过。
+
+## 2026-08-12 `--recover` 可重入恢复说明
+
+- README 现在列明只有 `old_moved`、`new_moved`、`started`、`health_failed` 且 previous 完整的现场才可尝试 `sudo 9router-update --recover`。
+- 说明显式恢复与日常更新持同一个锁，并对停服、ROOT 恢复、旧服务启动和清理使用持久 intent/commit。
+- 明确命令已生效但返回失败时不得手工改动现场，应重复执行同一条 `sudo 9router-update --recover`；阶段或目录不匹配时工具会拒绝猜测。

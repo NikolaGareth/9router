@@ -343,12 +343,15 @@ case "$1" in
   stop)
     [[ "$2" == 9router ]]
     if [[ "${NINEROUTER_TEST_REALISTIC_MISSING_UNIT:-0}" == 1 &&
-      ! -e "$NINEROUTER_SERVICE_TARGET" && ! -L "$NINEROUTER_SERVICE_TARGET" ]]; then
+      ! -e "$NINEROUTER_SERVICE_TARGET" && ! -L "$NINEROUTER_SERVICE_TARGET" &&
+      "$(cat "$NINEROUTER_TEST_SYSTEMCTL_STATE")" == inactive ]]; then
       exit 19
     fi
     [[ "${NINEROUTER_TEST_STOP_FAIL:-0}" != 1 ]] || exit 5
     if [[ "${NINEROUTER_TEST_STOP_REMAINS_ACTIVE:-0}" == 1 ]]; then
       printf 'active\n' >"$NINEROUTER_TEST_SYSTEMCTL_STATE"
+    elif [[ -n "${NINEROUTER_TEST_STOP_RESULT_STATE:-}" ]]; then
+      printf '%s\n' "$NINEROUTER_TEST_STOP_RESULT_STATE" >"$NINEROUTER_TEST_SYSTEMCTL_STATE"
     else
       printf 'inactive\n' >"$NINEROUTER_TEST_SYSTEMCTL_STATE"
     fi
@@ -364,6 +367,7 @@ case "$1" in
     else
       printf 'active\n' >"$NINEROUTER_TEST_SYSTEMCTL_STATE"
     fi
+    [[ "${NINEROUTER_TEST_START_FAIL_AFTER_MUTATION:-0}" != 1 ]] || exit 21
     if [[ "${NINEROUTER_TEST_SEND_TERM_ON_START:-0}" == 1 ]]; then
       if [[ -n "${NINEROUTER_TEST_START_BLOCKED_MARKER:-}" ]]; then
         : >"$NINEROUTER_TEST_START_BLOCKED_MARKER"
@@ -374,28 +378,28 @@ case "$1" in
     fi
     ;;
   is-active)
-    if [[ "${NINEROUTER_TEST_REALISTIC_MISSING_UNIT:-0}" == 1 &&
-      ! -e "$NINEROUTER_SERVICE_TARGET" && ! -L "$NINEROUTER_SERVICE_TARGET" ]]; then
-      if [[ "$2" == --quiet ]]; then
-        exit 4
-      fi
-      printf 'unknown\n'
-      exit 4
-    fi
+    quiet=0
     if [[ "$2" == --quiet && "$3" == 9router ]]; then
-      [[ "$(cat "$NINEROUTER_TEST_SYSTEMCTL_STATE")" == active ]] && exit 0
-      exit 3
+      quiet=1
+    else
+      [[ "$2" == 9router ]]
     fi
-    [[ "$2" == 9router ]]
     if [[ "${NINEROUTER_TEST_STOP_QUERY_ERROR:-0}" == 1 ]]; then
       printf 'Failed to connect to bus\n'
       exit 1
     fi
-    case "$(cat "$NINEROUTER_TEST_SYSTEMCTL_STATE")" in
-      active) printf 'active\n'; exit 0 ;;
-      inactive) printf 'inactive\n'; exit 3 ;;
-      failed) printf 'failed\n'; exit 3 ;;
-      *) printf 'unknown\n'; exit 4 ;;
+    state="$(cat "$NINEROUTER_TEST_SYSTEMCTL_STATE")"
+    if [[ "${NINEROUTER_TEST_REALISTIC_MISSING_UNIT:-0}" == 1 &&
+      ! -e "$NINEROUTER_SERVICE_TARGET" && ! -L "$NINEROUTER_SERVICE_TARGET" &&
+      "$state" == inactive ]]; then
+      (( quiet == 1 )) || printf 'inactive\n'
+      exit 4
+    fi
+    (( quiet == 1 )) || printf '%s\n' "$state"
+    case "$state" in
+      active|reloading) exit 0 ;;
+      activating|deactivating|inactive|failed) exit 3 ;;
+      *) exit 4 ;;
     esac
     ;;
   *)
@@ -515,6 +519,21 @@ if [[ "${NINEROUTER_TEST_FAIL_NEW_MOVE_BEFORE_MUTATION:-0}" == 1 && \
   "$source_path" == "$NINEROUTER_BUILD_DIR" && "$destination_path" == "$NINEROUTER_ROOT" ]]; then
   exit 74
 fi
+if [[ "$source_path" == "$NINEROUTER_PREVIOUS_DIR" &&
+  "$destination_path" == "${NINEROUTER_PREVIOUS_DIR}.retired" ]]; then
+  if [[ "${NINEROUTER_TEST_FAIL_PREVIOUS_RETIRE_BEFORE_MUTATION:-0}" == 1 ]]; then
+    exit 75
+  fi
+  if [[ "${NINEROUTER_TEST_KILL_BEFORE_PREVIOUS_RETIRE:-0}" == 1 ]]; then
+    kill -KILL "$PPID"
+    exit 76
+  fi
+fi
+if [[ "${NINEROUTER_TEST_FAIL_UPDATER_RECOVER_ROOT_AFTER_MUTATION:-0}" == 1 && \
+  "$source_path" == "$NINEROUTER_PREVIOUS_DIR" && "$destination_path" == "$NINEROUTER_ROOT" ]]; then
+  /bin/mv "$source_path" "$destination_path"
+  exit 77
+fi
 if [[ "${NINEROUTER_TEST_FAIL_RECOVERY_ROOT_STAGE_AFTER_MUTATION:-0}" == 1 && \
   "$source_path" == "$NINEROUTER_ROOT" && "$destination_path" == "$NINEROUTER_TEST_FAILED_ROOT" ]]; then
   /bin/mv "$source_path" "$destination_path"
@@ -624,7 +643,12 @@ EOF
 run_updater() {
   local output_file="$1"
   local updater_pid
+  local updater_arg=""
   shift
+  if [[ "${1:-}" == --recover ]]; then
+    updater_arg=--recover
+    shift
+  fi
   env \
     NINEROUTER_TEST_MODE=1 \
     NINEROUTER_TEST_ROOT="$TMP" \
@@ -633,6 +657,7 @@ run_updater() {
     NINEROUTER_PREVIOUS_DIR="$TMP/opt/9router.previous" \
     NINEROUTER_LOCK_FILE="$TMP/run/9router-update.lock" \
     NINEROUTER_PHASE_FILE="$TMP/run/9router-update.phase" \
+    NINEROUTER_RECOVER_FILE="$TMP/run/9router-update.recover" \
     NINEROUTER_GIT="$TMP/bin/git" \
     NINEROUTER_MV="$TMP/bin/mv" \
     NINEROUTER_STAT="$TMP/bin/stat" \
@@ -665,7 +690,7 @@ run_updater() {
     NINEROUTER_TEST_RECOVERY_DAEMON_RELOAD_MARKER="$TMP/recovery-daemon-reload.failed" \
     NINEROUTER_TEST_TERM_GO="$TMP/term-go" \
     PATH="$TMP/bin:$PATH" \
-    "$@" bash "$UPDATER" >"$output_file" 2>&1 &
+    "$@" bash "$UPDATER" ${updater_arg:+"$updater_arg"} >"$output_file" 2>&1 &
   updater_pid=$!
   if [[ -n "${NINEROUTER_TEST_UPDATER_PID_FILE:-}" ]]; then
     printf '%s\n' "$updater_pid" >"$NINEROUTER_TEST_UPDATER_PID_FILE"
@@ -700,6 +725,7 @@ run_installer() {
     NINEROUTER_PREVIOUS_DIR="$TMP/opt/9router.previous" \
     NINEROUTER_LOCK_FILE="$TMP/run/9router-update.lock" \
     NINEROUTER_PHASE_FILE="$TMP/run/9router-update.phase" \
+    NINEROUTER_RECOVER_FILE="$TMP/run/9router-update.recover" \
     NINEROUTER_RECOVERY_UNIT="$TMP/run/9router-install-recovery.unit" \
     NINEROUTER_RECOVERY_UPDATER="$TMP/run/9router-install-recovery.updater" \
     NINEROUTER_RECOVERY_ENABLE_STATE="$TMP/run/9router-install-recovery.enable-state" \
@@ -978,6 +1004,31 @@ test_installer_reconciles_absent_entrypoints_after_crash() {
   done
 }
 
+test_installer_queries_active_independently_for_missing_unit() {
+  new_install_tmp
+  make_fakes
+  prepare_recovery_matrix_installation 0 1
+  printf 'not-found\n' >"$TMP/systemctl.enabled"
+  printf 'active\n' >"$TMP/systemctl.state"
+  rm -f -- "$TMP/systemctl.wants-link"
+
+  if run_installer "$TMP/output-missing-unit-active" env \
+    NINEROUTER_TEST_REALISTIC_MISSING_UNIT=1 \
+    NINEROUTER_TEST_SIGNAL_AFTER_ENTRYPOINT_MOVE=updater \
+    NINEROUTER_TEST_ENTRYPOINT_SIGNAL=KILL; then
+    fail 'installer survived the missing-unit active-state capture crash'
+  fi
+  assert_file "$TMP/run/9router-install-entrypoints.state"
+  grep -Fqx 'enable_state=not-found' "$TMP/run/9router-install-entrypoints.state" ||
+    fail 'installer did not record the missing unit enable state'
+  grep -Fqx 'service_was_active=1' "$TMP/run/9router-install-entrypoints.state" ||
+    fail 'installer skipped the active query when is-enabled returned not-found'
+  grep -Fqx 'is-active --quiet 9router' "$TMP/systemctl.log" ||
+    fail 'installer did not independently query the missing unit active state'
+  cleanup
+  TMP=""
+}
+
 test_installer_uses_only_test_paths_and_preserves_existing_data() {
   new_install_tmp
   make_fakes
@@ -1015,7 +1066,7 @@ test_installer_uses_only_test_paths_and_preserves_existing_data() {
     'systemctl daemon-reload' \
     'systemctl enable 9router' \
     'git clone' \
-    'systemctl is-active --quiet 9router' \
+    'systemctl is-active 9router' \
     'systemctl stop 9router' \
     'systemctl is-active 9router' \
     'systemctl start 9router' \
@@ -1072,6 +1123,7 @@ test_first_install_failure_removes_new_unit() {
   new_install_tmp
   make_fakes
   printf 'not-found\n' >"$TMP/systemctl.enabled"
+  printf 'inactive\n' >"$TMP/systemctl.state"
   rm -f -- "$TMP/systemctl.wants-link"
   mkdir -p "$TMP/root/.9router"
   printf 'keep-this-data\n' >"$TMP/root/.9router/existing-data"
@@ -1318,6 +1370,7 @@ test_move_intent_failures_use_strict_scene_classification() {
   new_install_tmp
   make_fakes
   printf 'not-found\n' >"$TMP/systemctl.enabled"
+  printf 'inactive\n' >"$TMP/systemctl.state"
   rm -f -- "$TMP/systemctl.wants-link"
   if run_installer "$TMP/output-new-before-first" env \
     NINEROUTER_TEST_FAIL_NEW_MOVE_BEFORE_MUTATION=1; then
@@ -1550,6 +1603,14 @@ test_joint_recovery_covers_all_entrypoint_existence_quadrants() {
       fi
       [[ "$query_status" -eq 4 && "$queried_enable" == not-found ]] ||
         fail "$quadrant did not restore the externally observed not-found state"
+      if queried_active="$(NINEROUTER_TEST_REALISTIC_MISSING_UNIT=1 \
+        run_fake_systemctl is-active 9router 2>/dev/null)"; then
+        fail "$quadrant missing unit unexpectedly reported an active state"
+      else
+        query_status=$?
+      fi
+      [[ "$query_status" -eq 4 && "$queried_active" == inactive ]] ||
+        fail "$quadrant fake did not match missing-unit inactive/exit-4 semantics"
     else
       grep -Fqx "$expected_enable" "$TMP/systemctl.enabled" ||
         fail "$quadrant did not restore the original enable state"
@@ -1711,6 +1772,7 @@ test_generated_script_intermediate_write_failures_are_not_published() {
   new_install_tmp
   make_fakes
   printf 'not-found\n' >"$TMP/systemctl.enabled"
+  printf 'inactive\n' >"$TMP/systemctl.state"
   rm -f -- "$TMP/systemctl.wants-link"
   if run_installer "$TMP/output-cleanup-write-failure" env \
     NINEROUTER_TEST_CURL_MODE=fail \
@@ -1735,6 +1797,7 @@ test_generated_script_intermediate_write_failures_are_not_published() {
   new_install_tmp
   make_fakes
   printf 'not-found\n' >"$TMP/systemctl.enabled"
+  printf 'inactive\n' >"$TMP/systemctl.state"
   rm -f -- "$TMP/systemctl.wants-link"
   if run_installer "$TMP/output-cleanup-write-retry" env \
     NINEROUTER_TEST_CURL_MODE=fail; then
@@ -1914,6 +1977,7 @@ test_first_install_post_switch_cleanup_preserves_code_and_allows_retry() {
   new_install_tmp
   make_fakes
   printf 'not-found\n' >"$TMP/systemctl.enabled"
+  printf 'inactive\n' >"$TMP/systemctl.state"
   rm -f -- "$TMP/systemctl.wants-link"
   mkdir -p "$TMP/root/.9router"
   printf 'keep-first-install-data\n' >"$TMP/root/.9router/existing-data"
@@ -2345,6 +2409,196 @@ test_stop_failure_and_active_service_abort_before_switch() {
   TMP=""
 }
 
+test_updater_stops_all_running_and_transitioning_states() {
+  local initial_state
+
+  for initial_state in active reloading activating deactivating; do
+    new_tmp
+    make_fakes
+    mkdir -p "$TMP/opt/9router"
+    : >"$TMP/opt/9router/current-marker"
+    printf '%s\n' "$initial_state" >"$TMP/systemctl.state"
+    if ! run_updater "$TMP/output-$initial_state"; then
+      sed -n '1,160p' "$TMP/output-$initial_state" >&2
+      fail "updater failed while stopping initial $initial_state service"
+    fi
+    grep -Fqx 'stop 9router' "$TMP/systemctl.log" ||
+      fail "updater did not stop initial $initial_state service"
+    cleanup
+    TMP=""
+  done
+
+  new_tmp
+  make_fakes
+  mkdir -p "$TMP/opt/9router"
+  : >"$TMP/opt/9router/current-marker"
+  printf 'inactive\n' >"$TMP/systemctl.state"
+  if ! run_updater "$TMP/output-inactive-no-op"; then
+    fail 'updater failed on an explicitly inactive old service'
+  fi
+  ! grep -Fqx 'stop 9router' "$TMP/systemctl.log" ||
+    fail 'updater stopped an already inactive old service instead of using a no-op'
+  cleanup
+  TMP=""
+}
+
+test_updater_rejects_uncertain_post_stop_states() {
+  local post_stop_state
+
+  for post_stop_state in activating deactivating; do
+    new_tmp
+    make_fakes
+    mkdir -p "$TMP/opt/9router"
+    : >"$TMP/opt/9router/current-marker"
+    if run_updater "$TMP/output-post-stop-$post_stop_state" env \
+      "NINEROUTER_TEST_STOP_RESULT_STATE=$post_stop_state"; then
+      fail "updater switched while stop left service $post_stop_state"
+    fi
+    assert_file "$TMP/opt/9router/current-marker"
+    assert_not_exists "$TMP/opt/9router.previous"
+    cleanup
+    TMP=""
+  done
+}
+
+prepare_updater_recovery_scene() {
+  local phase="$1"
+  local root_state="${2:-absent}"
+
+  mkdir -p "$TMP/opt/9router.previous" "$TMP/opt/9router-build"
+  printf 'recover-old-runtime\n' >"$TMP/opt/9router.previous/old-marker"
+  printf 'recover-build\n' >"$TMP/opt/9router-build/build-marker"
+  if [[ "$root_state" == present ]]; then
+    mkdir -p "$TMP/opt/9router"
+    printf 'recover-new-runtime\n' >"$TMP/opt/9router/new-marker"
+    rm -rf -- "$TMP/opt/9router-build"
+  fi
+  printf '%s\n' "$phase" >"$TMP/run/9router-update.phase"
+  printf 'active\n' >"$TMP/systemctl.state"
+}
+
+test_updater_recover_supports_canonical_old_moved_and_resumes() {
+  local start_count
+
+  new_tmp
+  make_fakes
+  prepare_updater_recovery_scene old_moved absent
+  if ! run_updater "$TMP/output-recover-old-moved" --recover; then
+    sed -n '1,160p' "$TMP/output-recover-old-moved" >&2
+    fail 'updater --recover rejected canonical old_moved with absent ROOT'
+  fi
+  assert_file "$TMP/opt/9router/old-marker"
+  assert_not_exists "$TMP/opt/9router.previous"
+  assert_not_exists "$TMP/opt/9router.previous.retired"
+  assert_not_exists "$TMP/run/9router-update.phase"
+  assert_not_exists "$TMP/run/9router-update.recover"
+  cleanup
+  TMP=""
+
+  new_tmp
+  make_fakes
+  prepare_updater_recovery_scene old_moved absent
+  if run_updater "$TMP/output-recover-root-partial" --recover env \
+    NINEROUTER_TEST_FAIL_UPDATER_RECOVER_ROOT_AFTER_MUTATION=1; then
+    fail 'updater --recover hid a restore-root command failure after mutation'
+  fi
+  assert_file "$TMP/opt/9router/old-marker"
+  assert_not_exists "$TMP/opt/9router.previous"
+  assert_file "$TMP/run/9router-update.recover"
+  grep -Fqx 'stage=root_restored' "$TMP/run/9router-update.recover" ||
+    fail 'restore-root mutation was not durably committed for retry'
+  if ! run_updater "$TMP/output-recover-root-resume" --recover; then
+    sed -n '1,160p' "$TMP/output-recover-root-resume" >&2
+    fail 'updater --recover could not resume after restore-root mutation failure'
+  fi
+  assert_file "$TMP/opt/9router/old-marker"
+  assert_not_exists "$TMP/run/9router-update.recover"
+  cleanup
+  TMP=""
+
+  new_tmp
+  make_fakes
+  prepare_updater_recovery_scene old_moved absent
+  if run_updater "$TMP/output-recover-start-partial" --recover env \
+    NINEROUTER_TEST_START_FAIL_AFTER_MUTATION=1; then
+    fail 'updater --recover hid a start command failure after mutation'
+  fi
+  grep -Fqx 'stage=started' "$TMP/run/9router-update.recover" ||
+    fail 'start mutation was not durably committed for retry'
+  start_count="$(grep -Fxc 'start 9router' "$TMP/systemctl.log")"
+  [[ "$start_count" -eq 1 ]] || fail 'partial start scenario did not execute exactly once'
+  if ! run_updater "$TMP/output-recover-start-resume" --recover; then
+    fail 'updater --recover could not resume after start mutation failure'
+  fi
+  start_count="$(grep -Fxc 'start 9router' "$TMP/systemctl.log")"
+  [[ "$start_count" -eq 1 ]] || fail 'resumed recovery restarted an already active old service'
+  assert_not_exists "$TMP/run/9router-update.recover"
+  cleanup
+  TMP=""
+}
+
+test_previous_cleanup_intent_is_reconciled_before_new_update() {
+  local interruption
+
+  for interruption in failure crash; do
+    new_tmp
+    make_fakes
+    mkdir -p "$TMP/opt/9router"
+    printf 'cleanup-old-runtime\n' >"$TMP/opt/9router/current-marker"
+    if [[ "$interruption" == failure ]]; then
+      if run_updater "$TMP/output-cleanup-$interruption" env \
+        NINEROUTER_TEST_FAIL_PREVIOUS_RETIRE_BEFORE_MUTATION=1; then
+        fail 'updater ignored previous cleanup move failure after intent'
+      fi
+    elif run_updater "$TMP/output-cleanup-$interruption" env \
+      NINEROUTER_TEST_KILL_BEFORE_PREVIOUS_RETIRE=1; then
+      fail 'updater survived the previous cleanup pre-move crash'
+    fi
+    grep -Fqx 'previous_cleanup_intent' "$TMP/run/9router-update.phase" ||
+      fail "$interruption did not retain previous_cleanup_intent"
+    assert_file "$TMP/opt/9router.previous/current-marker"
+    assert_not_exists "$TMP/opt/9router.previous.retired"
+
+    if ! run_updater "$TMP/output-cleanup-$interruption-resume"; then
+      sed -n '1,160p' "$TMP/output-cleanup-$interruption-resume" >&2
+      fail "updater could not reconcile previous_cleanup_intent after $interruption"
+    fi
+    assert_not_exists "$TMP/opt/9router.previous"
+    assert_not_exists "$TMP/opt/9router.previous.retired"
+    grep -Fqx healthy "$TMP/run/9router-update.phase" ||
+      fail "$interruption retry did not reach healthy"
+    cleanup
+    TMP=""
+  done
+
+  new_tmp
+  make_fakes
+  mkdir -p "$TMP/opt/9router" "$TMP/opt/9router.previous.retired"
+  printf 'current-runtime\n' >"$TMP/opt/9router/current-marker"
+  printf 'retired-runtime\n' >"$TMP/opt/9router.previous.retired/old-marker"
+  printf 'previous_retired\n' >"$TMP/run/9router-update.phase"
+  if ! run_updater "$TMP/output-retired-resume"; then
+    fail 'updater could not continue deleting an already retired previous release'
+  fi
+  assert_not_exists "$TMP/opt/9router.previous.retired"
+  cleanup
+  TMP=""
+
+  new_tmp
+  make_fakes
+  mkdir -p "$TMP/opt/9router" "$TMP/opt/9router.previous"
+  printf 'current-runtime\n' >"$TMP/opt/9router/current-marker"
+  printf 'operator-previous\n' >"$TMP/opt/9router.previous/operator-marker"
+  printf 'preparing\n' >"$TMP/run/9router-update.phase"
+  if run_updater "$TMP/output-preparing-previous"; then
+    fail 'preparing phase overwrote an unrelated previous directory'
+  fi
+  assert_file "$TMP/opt/9router.previous/operator-marker"
+  assert_not_exists "$TMP/opt/9router.previous.retired"
+  cleanup
+  TMP=""
+}
+
 test_cross_filesystem_deployment_aborts_before_stop() {
   new_tmp
   make_fakes
@@ -2523,6 +2777,33 @@ test_health_rejects_inactive_service_and_trap_preserves_recovery_state() {
   TMP=""
 }
 
+if [[ "${NINEROUTER_TEST_FOCUS_IMPORTANT:-}" == installer-systemd ]]; then
+  test_installer_queries_active_independently_for_missing_unit
+  test_joint_recovery_covers_all_entrypoint_existence_quadrants
+  printf 'PASS: focused installer systemd semantics tests\n'
+  exit 0
+fi
+
+if [[ "${NINEROUTER_TEST_FOCUS_IMPORTANT:-}" == updater-systemd ]]; then
+  test_updater_stops_all_running_and_transitioning_states
+  test_updater_rejects_uncertain_post_stop_states
+  test_stop_failure_and_active_service_abort_before_switch
+  printf 'PASS: focused updater systemd semantics tests\n'
+  exit 0
+fi
+
+if [[ "${NINEROUTER_TEST_FOCUS_IMPORTANT:-}" == updater-recover ]]; then
+  test_updater_recover_supports_canonical_old_moved_and_resumes
+  printf 'PASS: focused updater recovery tests\n'
+  exit 0
+fi
+
+if [[ "${NINEROUTER_TEST_FOCUS_IMPORTANT:-}" == previous-cleanup ]]; then
+  test_previous_cleanup_intent_is_reconciled_before_new_update
+  printf 'PASS: focused previous cleanup reconciliation tests\n'
+  exit 0
+fi
+
 if [[ "${NINEROUTER_TEST_FOCUS_INSTALLER_RECOVERY:-0}" == 1 ]]; then
   test_installer_persists_and_reconciles_entrypoint_move_intents
   test_installer_reconciles_absent_entrypoints_after_crash
@@ -2541,6 +2822,7 @@ test_service_unit_uses_fixed_production_paths_without_credentials
 test_installer_has_root_guard_and_preserves_data_directory
 test_installer_persists_and_reconciles_entrypoint_move_intents
 test_installer_reconciles_absent_entrypoints_after_crash
+test_installer_queries_active_independently_for_missing_unit
 test_joint_recovery_covers_all_entrypoint_existence_quadrants
 test_recovery_generator_rejects_same_inode_material_tampering
 test_recovery_script_rejects_same_inode_material_tampering
@@ -2575,6 +2857,10 @@ test_rejects_unsafe_data_overlapping_and_symlink_paths
 test_rejects_unsafe_or_overlapping_lock_before_opening_it
 test_existing_previous_refuses_update_without_deletion
 test_stop_failure_and_active_service_abort_before_switch
+test_updater_stops_all_running_and_transitioning_states
+test_updater_rejects_uncertain_post_stop_states
+test_updater_recover_supports_canonical_old_moved_and_resumes
+test_previous_cleanup_intent_is_reconciled_before_new_update
 test_cross_filesystem_deployment_aborts_before_stop
 test_first_install_cross_filesystem_aborts_before_start
 test_build_and_node_check_failures_do_not_stop_service

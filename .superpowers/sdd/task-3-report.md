@@ -362,3 +362,33 @@ FAIL: installer could not reconcile originally absent entrypoints and retry
 最小修复在新 unit 仍存在时先清理 enable 链接，再按记录删除入口；若 unit 已 absent，则只可能是尚未安装或上一次已完成前置清理，`not-found` 终态不再向缺失 unit 重发 disable。两条回归均要求第二次安装不仅完成调和，还完整成功安装、比对新 unit/updater，并清空所有固定材料。
 
 修复后聚焦套件与完整套件均 exit 0；原审查者再次只读复核，结论为 `No findings（P0/P1/P2）`，确认该回归不是假绿。
+
+## 2026-08-12 终审 Important 恢复闭环
+
+本轮严格只修终审确认的四项 Important：
+
+- fake systemd 的 missing-unit `is-active` 改为与真实 systemd 一致：非 quiet 输出 `inactive` 且退出 4；installer 不再把 `is-enabled=not-found` 当作跳过 active 查询的条件，四种入口存在性现场均独立记录旧服务运行状态。
+- updater 在切换前把 `active`、`reloading`、`activating`、`deactivating` 全部视为必须 stop 的运行/过渡态；stop 后只接受明确的 `inactive` 或 `failed`，已 inactive 的旧进程现场保持 no-op。
+- `9router-update --recover` 新增同锁保护的 0600 原子持久阶段，支持规范 `old_moved`（ROOT absent、previous 与 BUILD present）；stop、ROOT 退役/恢复、start、retired/phase 清理均使用 intent/commit，并绑定 phase、ROOT、BUILD、previous 的 inode 与现场形态。命令已经改变现场但返回失败时先提交观测到的阶段，再要求重跑。
+- 正常更新启动时调和 `previous_cleanup_intent`：retired 已存在则续删；retired 不存在且 previous 完整时确认 move 未发生，再原子移动到 retired 后续删；其他阶段（包括 `preparing`）不被覆盖。
+
+严格 TDD 的首个红灯分别为：
+
+```text
+FAIL: installer skipped the active query when is-enabled returned not-found
+FAIL: updater did not stop initial activating service
+恢复现场不完整，拒绝操作
+FAIL: updater --recover rejected canonical old_moved with absent ROOT
+FAIL: updater could not reconcile previous_cleanup_intent after failure
+```
+
+对应四个聚焦入口随后均直接退出 0：
+
+```text
+PASS: focused installer systemd semantics tests
+PASS: focused updater systemd semantics tests
+PASS: focused updater recovery tests
+PASS: focused previous cleanup reconciliation tests
+```
+
+恢复回归实际注入了 previous→ROOT 和 start “已生效但命令返回失败”：前者持久提交 `stage=root_restored`，后者持久提交 `stage=started`；再次执行 `--recover` 均完成终态，且 start 总调用次数保持为 1。previous 收尾回归同时覆盖 intent 后 move 前普通失败和 SIGKILL，重跑后均完成退役清理；`preparing` 现场仍被保留并拒绝猜测。
