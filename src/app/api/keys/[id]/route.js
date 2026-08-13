@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { deleteApiKey, getApiKeyById, updateApiKey } from "@/lib/localDb";
+import { normalizeDailyCostLimit } from "@/lib/apiKeyQuota";
 
 // GET /api/keys/[id] - Get single key
 export async function GET(request, { params }) {
@@ -30,6 +31,13 @@ export async function PUT(request, { params }) {
 
     const updateData = {};
     if (isActive !== undefined) updateData.isActive = isActive;
+    if (Object.hasOwn(body, "dailyCostLimit")) {
+      try {
+        updateData.dailyCostLimit = normalizeDailyCostLimit(body.dailyCostLimit);
+      } catch (error) {
+        return NextResponse.json({ error: error.message }, { status: 400 });
+      }
+    }
 
     const updated = await updateApiKey(id, updateData);
 

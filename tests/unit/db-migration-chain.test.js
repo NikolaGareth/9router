@@ -37,6 +37,10 @@ describe("Schema migrations", () => {
       "_meta", "settings", "providerConnections", "providerNodes",
       "proxyPools", "apiKeys", "combos", "kv", "usageHistory", "usageDaily", "requestDetails",
     ]));
+    expect(db.all(`PRAGMA table_info(apiKeys)`).map((column) => column.name)).toContain("dailyCostLimit");
+    expect(db.all(`PRAGMA index_list(usageHistory)`).map((index) => index.name)).toContain("idx_uh_api_key_ts");
+    const backupVersion = db.get(`SELECT value FROM _meta WHERE key='backupSchemaVersion'`);
+    expect(parseInt(backupVersion.value, 10)).toBe(2);
   });
 
   it("existing DB at older schemaVersion → re-applies pending migrations on restart", async () => {

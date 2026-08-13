@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { getSettings, validateApiKey } from "@/lib/localDb";
+import { getSettings, checkApiKeyAccess } from "@/lib/localDb";
+import { getQuotaRetryAfter } from "@/lib/apiKeyQuota";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { verifyDashboardAuthToken } from "@/lib/auth/dashboardSession";
 
@@ -127,16 +128,18 @@ function extractApiKey(request) {
   return request.nextUrl.searchParams?.get("key") || null;
 }
 
-async function hasValidApiKey(request) {
+async function getApiKeyAccess(request) {
   const apiKey = extractApiKey(request);
-  if (!apiKey) return false;
-  return await validateApiKey(apiKey);
+  if (!apiKey) return null;
+  return await checkApiKeyAccess(apiKey);
 }
 
 async function canAccessPublicLlmApi(request) {
-  if (isLocalRequest(request)) return true;
-  if (await hasValidCliToken(request)) return true;
-  return await hasValidApiKey(request);
+  const keyAccess = await getApiKeyAccess(request);
+  if (keyAccess) return keyAccess;
+  if (isLocalRequest(request)) return { allowed: true, reason: "local" };
+  if (await hasValidCliToken(request)) return { allowed: true, reason: "cli" };
+  return { allowed: false, reason: "missing" };
 }
 
 async function canAccessLocalOnlyRoute(request) {
@@ -198,7 +201,24 @@ export async function proxy(request) {
   }
 
   if (isPublicLlmApi(pathname)) {
-    if (await canAccessPublicLlmApi(request)) return NextResponse.next();
+    const access = await canAccessPublicLlmApi(request);
+    if (access.allowed) return NextResponse.next();
+    if (access.reason === "quota_exceeded") {
+      const usage = access.usage;
+      return NextResponse.json({
+        error: {
+          code: "daily_cost_limit_exceeded",
+          message: "API key daily estimated cost limit exceeded",
+          limit: usage.limit,
+          used: usage.used,
+          remaining: usage.remaining,
+          resetAt: usage.resetAt,
+        },
+      }, {
+        status: 429,
+        headers: { "Retry-After": String(getQuotaRetryAfter(usage.resetAt)) },
+      });
+    }
     return NextResponse.json({ error: "API key required for remote API access" }, { status: 401 });
   }
 

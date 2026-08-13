@@ -17,6 +17,7 @@ import EndpointRow from "./components/EndpointRow";
 import StatusAlert from "./components/StatusAlert";
 import Tooltip from "./components/Tooltip";
 import SecurityWarning from "./components/SecurityWarning";
+import { getQuotaPresentation, parseDailyCostLimitInput } from "./quotaPresentation";
 export default function APIPageClient({ machineId }) {
   const [keys, setKeys] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -24,6 +25,12 @@ export default function APIPageClient({ machineId }) {
   const [newKeyName, setNewKeyName] = useState("");
   const [createdKey, setCreatedKey] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
+  const [editingQuotaKey, setEditingQuotaKey] = useState(null);
+  const [quotaValue, setQuotaValue] = useState("");
+  const [quotaUnlimited, setQuotaUnlimited] = useState(true);
+  const [quotaSaving, setQuotaSaving] = useState(false);
+  const [quotaError, setQuotaError] = useState("");
+  const [keysRefreshStatus, setKeysRefreshStatus] = useState(null);
 
   const [requireApiKey, setRequireApiKey] = useState(false);
   const [requireLogin, setRequireLogin] = useState(true);
@@ -256,8 +263,8 @@ export default function APIPageClient({ machineId }) {
   const fetchData = async () => {
     try {
       const fetchKeys = async () => {
-        const res = await fetch("/api/keys");
-        if (!res.ok) return [];
+        const res = await fetch("/api/keys", { cache: "no-store" });
+        if (!res.ok) throw new Error("Failed to refresh API key usage");
         const data = await res.json();
         return data.keys || [];
       };
@@ -275,12 +282,27 @@ export default function APIPageClient({ machineId }) {
         } catch { /* fall through to empty render */ }
       }
       setKeys(existing);
+      setKeysRefreshStatus(null);
     } catch (error) {
       console.log("Error fetching data:", error);
+      setKeysRefreshStatus({ type: "warning", message: "Could not refresh API key usage. Showing the last available values." });
     } finally {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    const refresh = () => {
+      if (!document.hidden) fetchData();
+    };
+    const timer = setInterval(refresh, 30000);
+    const onVisible = () => { if (!document.hidden) fetchData(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
 
   // u2500u2500u2500 Cloudflare Tunnel handlers
   // Ping tunnel health until reachable. Race multiple URLs (shortlink + direct) — 1 OK is enough.
@@ -682,6 +704,53 @@ export default function APIPageClient({ machineId }) {
     }
   };
 
+  const openQuotaEditor = (key) => {
+    setEditingQuotaKey(key);
+    setQuotaUnlimited(key.dailyCostLimit == null);
+    setQuotaValue(key.dailyCostLimit == null ? "" : String(key.dailyCostLimit));
+    setQuotaError("");
+  };
+
+  const closeQuotaEditor = () => {
+    if (quotaSaving) return;
+    setEditingQuotaKey(null);
+    setQuotaError("");
+  };
+
+  const handleSaveQuota = async () => {
+    if (!editingQuotaKey) return;
+    let dailyCostLimit = null;
+    if (!quotaUnlimited) {
+      const parsed = parseDailyCostLimitInput(quotaValue);
+      if (parsed.error) {
+        setQuotaError(parsed.error);
+        return;
+      }
+      dailyCostLimit = parsed.value;
+    }
+
+    setQuotaSaving(true);
+    setQuotaError("");
+    try {
+      const res = await fetch(`/api/keys/${editingQuotaKey.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dailyCostLimit }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setQuotaError(data.error || "Failed to save daily limit.");
+        return;
+      }
+      setEditingQuotaKey(null);
+      await fetchData();
+    } catch (error) {
+      setQuotaError(error.message || "Failed to save daily limit.");
+    } finally {
+      setQuotaSaving(false);
+    }
+  };
+
   const maskKey = (fullKey) => {
     if (!fullKey || fullKey.length <= 10) return fullKey || "";
     return fullKey.slice(0, 6) + "•".repeat(fullKey.length - 10) + fullKey.slice(-4);
@@ -994,6 +1063,10 @@ export default function APIPageClient({ machineId }) {
           </div>
         )}
 
+        {keysRefreshStatus && (
+          <StatusAlert status={keysRefreshStatus} className="mb-4" />
+        )}
+
         {keys.length === 0 ? (
           <div className="text-center py-12">
             <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-primary/10 text-primary mb-4">
@@ -1039,11 +1112,27 @@ export default function APIPageClient({ machineId }) {
                   <p className="text-xs text-text-muted mt-1">
                     Created {new Date(key.createdAt).toLocaleDateString()}
                   </p>
+                  {(() => {
+                    const quota = getQuotaPresentation(key);
+                    return (
+                      <p className={`text-xs mt-1 ${quota.tone === "danger" ? "text-red-500" : quota.tone === "warning" ? "text-orange-500" : "text-text-muted"}`}>
+                        {quota.text}
+                      </p>
+                    );
+                  })()}
                   {key.isActive === false && (
                     <p className="text-xs text-orange-500 mt-1">Paused</p>
                   )}
                 </div>
                 <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => openQuotaEditor(key)}
+                    className="p-2 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-muted hover:text-primary transition-all"
+                    title="Edit daily estimated cost limit"
+                    aria-label={`Edit daily estimated cost limit for ${key.name}`}
+                  >
+                    <span className="material-symbols-outlined text-[18px]">edit</span>
+                  </button>
                   <Toggle
                     size="sm"
                     checked={key.isActive ?? true}
@@ -1106,6 +1195,55 @@ export default function APIPageClient({ machineId }) {
             >
               Cancel
             </Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        isOpen={!!editingQuotaKey}
+        title="Edit Daily Estimated Cost Limit"
+        onClose={closeQuotaEditor}
+      >
+        <div className="flex flex-col gap-4">
+          <div>
+            <p className="text-sm font-medium">{editingQuotaKey?.name}</p>
+            <p className="text-xs text-text-muted mt-1">
+              Resets daily at 00:00 Asia/Shanghai. Requests with unknown pricing count as $0.00.
+            </p>
+          </div>
+          <label className="flex items-center gap-3 p-3 rounded-[10px] bg-surface-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={quotaUnlimited}
+              onChange={(event) => {
+                setQuotaUnlimited(event.target.checked);
+                setQuotaError("");
+              }}
+              className="accent-primary"
+            />
+            <span className="text-sm font-medium">Unlimited</span>
+          </label>
+          {!quotaUnlimited && (
+            <Input
+              label="Daily limit (USD)"
+              type="number"
+              min="0.01"
+              step="0.01"
+              inputMode="decimal"
+              value={quotaValue}
+              onChange={(event) => {
+                setQuotaValue(event.target.value);
+                setQuotaError("");
+              }}
+              placeholder="10.00"
+              error={quotaError}
+              autoFocus
+            />
+          )}
+          {quotaUnlimited && quotaError && <p className="text-xs text-red-500">{quotaError}</p>}
+          <div className="flex gap-2">
+            <Button onClick={handleSaveQuota} fullWidth loading={quotaSaving}>Save</Button>
+            <Button onClick={closeQuotaEditor} variant="ghost" fullWidth disabled={quotaSaving}>Cancel</Button>
           </div>
         </div>
       </Modal>
