@@ -17,6 +17,7 @@ import EndpointRow from "./components/EndpointRow";
 import StatusAlert from "./components/StatusAlert";
 import Tooltip from "./components/Tooltip";
 import SecurityWarning from "./components/SecurityWarning";
+import ApiKeyBudgetPool from "./components/ApiKeyBudgetPool";
 import { getQuotaPresentation, parseDailyCostLimitInput } from "./quotaPresentation";
 export default function APIPageClient({ machineId }) {
   const [keys, setKeys] = useState([]);
@@ -1066,6 +1067,8 @@ export default function APIPageClient({ machineId }) {
         {keysRefreshStatus && (
           <StatusAlert status={keysRefreshStatus} className="mb-4" />
         )}
+
+        <ApiKeyBudgetPool keys={keys} onSaved={fetchData} />
 
         {keys.length === 0 ? (
           <div className="text-center py-12">
