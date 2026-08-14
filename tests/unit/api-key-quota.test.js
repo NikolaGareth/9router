@@ -102,4 +102,23 @@ describe("API key daily cost quota", () => {
       apiKeys: [{ id: "bad", key: "sk-bad", name: "bad", dailyCostLimit: "abc" }],
     })).rejects.toThrow(/Daily cost limit/);
   });
+
+  it("updates multiple key limits atomically", async () => {
+    const dbApi = await import("@/lib/db/index.js");
+    const first = await dbApi.createApiKey("first", "machine-a");
+    const second = await dbApi.createApiKey("second", "machine-a");
+
+    await dbApi.updateApiKeyDailyCostLimits([
+      { id: first.id, dailyCostLimit: 4.75 },
+      { id: second.id, dailyCostLimit: 6.25 },
+    ]);
+    expect((await dbApi.getApiKeyById(first.id)).dailyCostLimit).toBe(4.75);
+    expect((await dbApi.getApiKeyById(second.id)).dailyCostLimit).toBe(6.25);
+
+    await expect(dbApi.updateApiKeyDailyCostLimits([
+      { id: first.id, dailyCostLimit: 1 },
+      { id: "missing", dailyCostLimit: 1 },
+    ])).rejects.toThrow(/not found/);
+    expect((await dbApi.getApiKeyById(first.id)).dailyCostLimit).toBe(4.75);
+  });
 });

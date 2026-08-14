@@ -120,3 +120,30 @@ export async function checkApiKeyAccess(key, now = new Date()) {
   if (usage.exceeded) return { allowed: false, reason: "quota_exceeded", usage };
   return { allowed: true, reason: "ok", usage };
 }
+
+export async function updateApiKeyDailyCostLimits(allocations) {
+  if (!Array.isArray(allocations) || allocations.length === 0) {
+    throw new TypeError("At least one API key allocation is required");
+  }
+  const normalized = allocations.map((allocation) => ({
+    id: allocation?.id,
+    dailyCostLimit: normalizeDailyCostLimit(allocation?.dailyCostLimit),
+  }));
+  if (normalized.some((allocation) => !allocation.id)) throw new TypeError("Every allocation requires an API key id");
+  if (new Set(normalized.map((allocation) => allocation.id)).size !== normalized.length) {
+    throw new TypeError("Duplicate API key allocations are not allowed");
+  }
+
+  const db = await getAdapter();
+  let updated = [];
+  db.transaction(() => {
+    const placeholders = normalized.map(() => "?").join(",");
+    const found = db.all(`SELECT id FROM apiKeys WHERE id IN (${placeholders})`, normalized.map((allocation) => allocation.id));
+    if (found.length !== normalized.length) throw new Error("One or more API keys were not found");
+    for (const allocation of normalized) {
+      db.run(`UPDATE apiKeys SET dailyCostLimit = ? WHERE id = ?`, [allocation.dailyCostLimit, allocation.id]);
+    }
+    updated = normalized.map((allocation) => rowToKey(db.get(`SELECT * FROM apiKeys WHERE id = ?`, [allocation.id])));
+  });
+  return updated;
+}
